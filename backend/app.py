@@ -253,6 +253,8 @@ DEFAULT_DB = {"schools": [], "submissions": [], "templates": [], "orders": [], "
 }, "deleted_items": []}
 
 db_lock = threading.RLock()
+db_init_lock = threading.RLock()
+db_initialized = False
 rate_bucket = {}
 login_failures = {}   # ip -> {'count': int, 'locked_until': float}
 reset_otps = {}       # phone -> {'hash': str, 'expires': float, 'attempts': int}
@@ -277,7 +279,7 @@ def password_matches(raw, stored_hash):
 def current_admin_password_ok(raw):
     configured_pass = os.environ.get('SCREENPLANT_ADMIN_PASSWORD', _default_admin_pass)
     try:
-        stored_hash = load_db().get('settings', {}).get('admin_password_hash', '')
+        stored_hash = db_get_settings().get('admin_password_hash', '')
         if stored_hash:
             return password_matches(raw, stored_hash)
     except Exception:
@@ -746,16 +748,24 @@ def init_sqlite_db():
         conn.commit()
 
 def init_db():
-    if not use_postgres():
-        init_sqlite_db()
+    global db_initialized
+    if db_initialized:
         return
-    _, _, Jsonb = pg_driver()
-    with closing(pg_conn()) as conn:
-        pg_create_tables(conn)
-        if not pg_has_relational_data(conn):
-            payload = pg_load_legacy_state(conn) or load_sqlite_state() or load_json_state() or ensure_db_shape(DEFAULT_DB.copy())
-            pg_insert_rows(conn, payload, Jsonb)
-        conn.commit()
+    with db_init_lock:
+        if db_initialized:
+            return
+        if not use_postgres():
+            init_sqlite_db()
+            db_initialized = True
+            return
+        _, _, Jsonb = pg_driver()
+        with closing(pg_conn()) as conn:
+            pg_create_tables(conn)
+            if not pg_has_relational_data(conn):
+                payload = pg_load_legacy_state(conn) or load_sqlite_state() or load_json_state() or ensure_db_shape(DEFAULT_DB.copy())
+                pg_insert_rows(conn, payload, Jsonb)
+            conn.commit()
+        db_initialized = True
 
 def recover_from_json_backup():
     backups = sorted(
@@ -823,6 +833,49 @@ def db_get_school(school_id):
             (school_id,)
         ).fetchone()
         return row[0] if row else None
+
+def db_get_settings():
+    init_db()
+    if not use_postgres():
+        with closing(sqlite_conn()) as conn:
+            row = conn.execute('SELECT data FROM screenplant_settings WHERE id = 1').fetchone()
+            return json.loads(row[0]) if row else {}
+    with closing(pg_conn()) as conn:
+        row = conn.execute('SELECT data FROM screenplant_settings WHERE id = 1').fetchone()
+        return row[0] if row else {}
+
+def public_school_payload(school):
+    return {
+        "id": school.get("id"),
+        "name": school.get("name", ""),
+        "type": school.get("type", "School"),
+        "color": school.get("color", "#1a73e8"),
+        "form_schema": school.get("form_schema", []),
+        "classes": school.get("classes", []),
+    }
+
+def db_list_schools(public_only=True):
+    init_db()
+    if not use_postgres():
+        with closing(sqlite_conn()) as conn:
+            rows = conn.execute('SELECT data FROM screenplant_schools ORDER BY name, id').fetchall()
+            schools = [json.loads(row[0]) for row in rows]
+            if public_only:
+                return [public_school_payload(s) for s in schools]
+            counts = dict(conn.execute('SELECT school_id, COUNT(*) FROM screenplant_submissions GROUP BY school_id').fetchall())
+            for school in schools:
+                school['submission_count'] = int(counts.get(school.get('id'), 0) or 0)
+            return schools
+    with closing(pg_conn()) as conn:
+        rows = conn.execute('SELECT data FROM screenplant_schools ORDER BY name, id').fetchall()
+        schools = [row[0] for row in rows]
+        if public_only:
+            return [public_school_payload(s) for s in schools]
+        count_rows = conn.execute('SELECT school_id, COUNT(*) FROM screenplant_submissions GROUP BY school_id').fetchall()
+        counts = {row[0]: int(row[1] or 0) for row in count_rows}
+        for school in schools:
+            school['submission_count'] = counts.get(school.get('id'), 0)
+        return schools
 
 def db_insert_submission(sub):
     init_db()
@@ -2053,21 +2106,9 @@ def serve_upload(filename):
 # ══════════════════════════════════════════════════════════════════════════════
 @app.route('/api/schools', methods=['GET'])
 def get_schools():
-    db = load_db()
-    schools = db['schools']
     if not is_admin():
-        return jsonify([{
-            "id": s.get("id"),
-            "name": s.get("name", ""),
-            "type": s.get("type", "School"),
-            "color": s.get("color", "#1a73e8"),
-            "form_schema": s.get("form_schema", []),
-            "classes": s.get("classes", [])
-        } for s in schools])
-    # Enrich with submission count
-    for s in schools:
-        s['submission_count'] = sum(1 for sub in db['submissions'] if sub.get('school_id') == s['id'])
-    return jsonify(schools)
+        return jsonify(db_list_schools(public_only=True))
+    return jsonify(db_list_schools(public_only=False))
 
 @app.route('/api/schools/<school_id>/health', methods=['GET'])
 @admin_required
@@ -4867,3 +4908,4 @@ if __name__ == '__main__':
     print("  Admin: http://localhost:5000")
     print("="*50 + "\n")
     app.run(debug=os.environ.get('FLASK_DEBUG') == '1', port=parse_int(os.environ.get('PORT'), 5000, 1, 65535), use_reloader=False)
+
