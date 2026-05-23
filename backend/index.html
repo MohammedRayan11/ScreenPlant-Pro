@@ -260,6 +260,16 @@ body::before{
   font-size:1.15rem;font-weight:900;
   box-shadow:0 6px 18px rgba(255,107,43,.35);
 }
+.brand-hex,.bh-sm{
+  font-size:0;
+}
+.brand-hex::before,.bh-sm::before{
+  content:"SP";
+  font-family:var(--fb);
+  font-size:.78rem;
+  font-weight:900;
+  letter-spacing:0;
+}
 
 .login-card{
   width:100%;
@@ -698,8 +708,9 @@ body::before{
 .sc-purple::before{background:linear-gradient(90deg,var(--purple),#a78bfa)}
 .scard:hover{transform:translateY(-2px);box-shadow:var(--shadow-md)}
 .scard-val{
-  font-family:var(--fh);font-size:1.85rem;font-weight:700;
+  font-family:var(--fb);font-size:1.85rem;font-weight:800;
   color:var(--text);line-height:1;
+  font-variant-numeric:tabular-nums;
 }
 .scard-label{
   color:var(--text2);font-size:.75rem;margin-top:4px;
@@ -734,8 +745,10 @@ body::before{
   width:34px;height:42px;border-radius:8px;
   background:var(--bg4);border:1px solid var(--border);
   overflow:hidden;display:flex;align-items:center;
-  justify-content:center;font-size:1.1rem;flex-shrink:0;
+  justify-content:center;font-size:0;flex-shrink:0;
 }
+.r-av::before{content:"ID";font-size:.7rem;font-weight:900;color:var(--text3);letter-spacing:0}
+.r-av:has(img)::before{content:""}
 .r-av img{width:100%;height:100%;object-fit:cover}
 .r-name{font-weight:600;font-size:.83rem;color:var(--text)}
 .r-meta{font-size:.73rem;color:var(--text2)}
@@ -755,6 +768,33 @@ body::before{
   box-shadow:0 8px 20px rgba(255,107,43,.1);
 }
 .qa span{font-size:1.4rem}
+.db-kpi-val,
+.db-rc-stat span,
+.sc-stat-v,
+.export-stat strong,
+#s-today{
+  font-family:var(--fb)!important;
+  font-variant-numeric:tabular-nums;
+  letter-spacing:0;
+}
+.db-qa-icon{
+  font-size:0!important;
+}
+.db-qa-icon::before{
+  font-size:.86rem;
+  font-weight:900;
+  letter-spacing:0;
+  font-family:var(--fb);
+}
+.db-qa:nth-child(1) .db-qa-icon::before{content:"+"}
+.db-qa:nth-child(2) .db-qa-icon::before{content:"VIEW"}
+.db-qa:nth-child(3) .db-qa-icon::before{content:"ID"}
+.db-qa:nth-child(4) .db-qa-icon::before{content:"LINK"}
+.db-qa:nth-child(5) .db-qa-icon::before{content:"CSV"}
+.db-qa:nth-child(6) .db-qa-icon::before{content:"TPL"}
+.db-qa:nth-child(7) .db-qa-icon::before{content:"CHT"}
+.db-qa:nth-child(8) .db-qa-icon::before{content:"PIC"}
+.db-qa:nth-child(9) .db-qa-icon::before{content:"?"}
 
 /* â”€â”€â”€ SEARCH BAR â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
 .sbar{
@@ -1573,6 +1613,27 @@ body::before{
 }
 .db-qa span{font-size:.75rem;text-align:center;line-height:1.2}
 
+/* Final typography/icon cleanup: keep dashboard numbers and tiles clean. */
+.db-kpi-val,
+.db-rc-stat span,
+.scard-val,
+.sc-stat-v,
+.export-stat strong,
+#s-today{
+  font-family:var(--fb)!important;
+  font-variant-numeric:tabular-nums;
+  letter-spacing:0;
+}
+.db-qa-icon{font-size:0!important}
+.db-qa-icon::before{
+  font-size:.78rem;
+  font-weight:900;
+  font-family:var(--fb);
+  letter-spacing:0;
+}
+.brand-hex,.bh-sm{font-size:0!important}
+.brand-hex::before,.bh-sm::before{content:"SP";font-size:.78rem!important}
+
 /* â”€â”€ Hero responsive â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
 @media(max-width:900px){
   .db-hero-inner{grid-template-columns:1fr;padding:28px 24px}
@@ -2071,6 +2132,11 @@ tr:hover .sp-flow{height:22px}
     will-change: transform;
   }
 }
+/* Final dashboard polish: prevent mobile overrides from reviving corrupt icon text. */
+.brand-hex,.bh-sm{font-size:0!important}
+.brand-hex::before,.bh-sm::before{content:"SP";font-size:.78rem!important;font-family:var(--fb);font-weight:900;letter-spacing:0}
+.db-kpi-val,.db-rc-stat span,.scard-val,.sc-stat-v,.export-stat strong,#s-today{font-family:var(--fb)!important;font-variant-numeric:tabular-nums;letter-spacing:0}
+.db-qa-icon{font-size:0!important}
 </style>
 </head>
 <body>
@@ -2079,7 +2145,7 @@ tr:hover .sp-flow{height:22px}
 <div id="pg-login" class="page active">
   <div class="login-bg"><div class="login-grid"></div><div class="login-glow"></div></div>
   <div class="login-wrap">
-    <div class="brand"><div class="brand-hex">â¬¡</div>ScreenPlant <em>Pro</em></div>
+    <div class="brand"><div class="brand-hex">SP</div>ScreenPlant <em>Pro</em></div>
     <div class="login-card">
       <h1>Welcome back</h1>
       <p>Sign in to your admin dashboard</p>
@@ -2098,14 +2164,14 @@ tr:hover .sp-flow{height:22px}
 <!-- â•â•â•â•â•â•â•â•â•â•â•â•â•â• CLIENT PORTAL â•â•â•â•â•â•â•â•â•â•â•â•â•â• -->
 <div id="pg-client" class="page">
   <div class="client-hdr">
-    <div class="brand-sm"><div class="bh-sm">â¬¡</div>ScreenPlant <em>Pro</em></div>
+    <div class="brand-sm"><div class="bh-sm">SP</div>ScreenPlant <em>Pro</em></div>
     <button class="btn btn-s" id="client-back-tool" onclick="returnToTool()" style="display:none">
       Back to Tool
     </button>
   </div>
   <div class="client-body">
     <div class="school-banner">
-      <div class="school-icon-lg" id="c-school-ico">ðŸ«</div>
+      <div class="school-icon-lg" id="c-school-ico">SCH</div>
       <div style="flex:1">
         <div class="sbn" id="c-school-name">Select your school below</div>
         <div class="sbs">ID Card Submission Portal</div>
@@ -2114,7 +2180,7 @@ tr:hover .sp-flow{height:22px}
 
     <!-- School selector â€” prominent, before the form -->
     <div class="school-sel-top" id="c-school-sel-wrap">
-      <label>ðŸ“‹ School / Org</label>
+      <label>School / Org</label>
       <select id="c-school" class="fg" style="background:var(--bg2);border:1px solid var(--border2);border-radius:8px;padding:9px 12px;color:var(--text);font-family:var(--fb);font-size:.88rem;outline:none;cursor:pointer;width:100%" onchange="onSchoolChange()">
         <option value="">-- Select your school / organization --</option>
       </select>
@@ -2122,7 +2188,7 @@ tr:hover .sp-flow{height:22px}
 
     <!-- Class & Section gate (shown after school selected) -->
     <div id="c-class-gate" style="display:none;background:var(--bg2);border:1px solid var(--border2);border-radius:14px;padding:20px;margin-bottom:4px">
-      <div style="font-family:var(--fh);font-weight:700;font-size:1rem;margin-bottom:4px">ðŸ“š Select Your Class</div>
+      <div style="font-family:var(--fh);font-weight:700;font-size:1rem;margin-bottom:4px">Select Your Class</div>
       <div style="font-size:.8rem;color:var(--text2);margin-bottom:14px">Choose your class before filling the form</div>
       <div style="display:flex;flex-direction:column;gap:10px">
         <div class="fg">
@@ -2206,7 +2272,7 @@ tr:hover .sp-flow{height:22px}
 <!-- â•â•â•â•â•â•â•â•â•â•â•â•â•â• ADMIN â•â•â•â•â•â•â•â•â•â•â•â•â•â• -->
 <div id="pg-admin" class="page">
   <aside class="sidebar" id="sidebar">
-    <div class="sb-brand"><div class="brand-hex">â¬¡</div>ScreenPlant <em>Pro</em></div>
+    <div class="sb-brand"><div class="brand-hex">SP</div>ScreenPlant <em>Pro</em></div>
     <nav class="sb-nav">
       <div class="nav-i active" onclick="tab('dashboard',this)"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/></svg> Dashboard</div>
       <div class="nav-i" onclick="tab('schools',this)"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg> Schools / Orgs</div>
@@ -2320,7 +2386,7 @@ tr:hover .sp-flow{height:22px}
               <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>
             </div>
             <div class="db-kpi-content">
-              <div class="db-kpi-val" id="s-schools">â€”</div>
+              <div class="db-kpi-val" id="s-schools">0</div>
               <div class="db-kpi-label">Schools</div>
             </div>
             <div class="db-kpi-spark">
@@ -2332,7 +2398,7 @@ tr:hover .sp-flow{height:22px}
               <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>
             </div>
             <div class="db-kpi-content">
-              <div class="db-kpi-val" id="s-subs">â€”</div>
+              <div class="db-kpi-val" id="s-subs">0</div>
               <div class="db-kpi-label">Submissions</div>
             </div>
             <div class="db-kpi-spark">
@@ -2344,7 +2410,7 @@ tr:hover .sp-flow{height:22px}
               <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="5" width="20" height="14" rx="2"/><line x1="2" y1="10" x2="22" y2="10"/></svg>
             </div>
             <div class="db-kpi-content">
-              <div class="db-kpi-val" id="s-gen">â€”</div>
+              <div class="db-kpi-val" id="s-gen">0</div>
               <div class="db-kpi-label">Generated</div>
             </div>
             <div class="db-kpi-spark">
@@ -2356,7 +2422,7 @@ tr:hover .sp-flow{height:22px}
               <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
             </div>
             <div class="db-kpi-content">
-              <div class="db-kpi-val" id="s-pend">â€”</div>
+              <div class="db-kpi-val" id="s-pend">0</div>
               <div class="db-kpi-label">Pending</div>
             </div>
             <div class="db-kpi-spark">
@@ -2368,7 +2434,7 @@ tr:hover .sp-flow{height:22px}
               <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="12" y1="1" x2="12" y2="23"/><path d="M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"/></svg>
             </div>
             <div class="db-kpi-content">
-              <div class="db-kpi-val" id="s-rev">â‚¹0</div>
+              <div class="db-kpi-val" id="s-rev">Rs 0</div>
               <div class="db-kpi-label">Revenue</div>
             </div>
             <div class="db-kpi-spark">
@@ -2440,27 +2506,27 @@ tr:hover .sp-flow{height:22px}
               </div>
               <div class="db-qa-grid">
                 <button class="db-qa" onclick="tab('schools',null);setTimeout(()=>openSchoolModal(),200)">
-                  <div class="db-qa-icon" style="background:rgba(37,99,235,.1);color:#2563eb">ðŸ«</div>
+                  <div class="db-qa-icon" style="background:rgba(37,99,235,.1);color:#2563eb">+</div>
                   <span>Add School</span>
                 </button>
                 <button class="db-qa" onclick="tab('submissions',null)">
-                  <div class="db-qa-icon" style="background:rgba(255,107,43,.1);color:#ff6b2b">ðŸ‘ï¸</div>
+                  <div class="db-qa-icon" style="background:rgba(255,107,43,.1);color:#ff6b2b">VIEW</div>
                   <span>View Data</span>
                 </button>
                 <button class="db-qa" onclick="tab('generate',null)">
-                  <div class="db-qa-icon" style="background:rgba(5,150,105,.1);color:#059669">ðŸ–¨ï¸</div>
+                  <div class="db-qa-icon" style="background:rgba(5,150,105,.1);color:#059669">ID</div>
                   <span>Print Cards</span>
                 </button>
                 <button class="db-qa" onclick="tab('links',null)">
-                  <div class="db-qa-icon" style="background:rgba(124,58,237,.1);color:#7c3aed">ðŸ”—</div>
+                  <div class="db-qa-icon" style="background:rgba(124,58,237,.1);color:#7c3aed">LINK</div>
                   <span>Share Link</span>
                 </button>
                 <button class="db-qa" onclick="exportCSV()">
-                  <div class="db-qa-icon" style="background:rgba(13,148,136,.1);color:#0d9488">ðŸ“Š</div>
+                  <div class="db-qa-icon" style="background:rgba(13,148,136,.1);color:#0d9488">CSV</div>
                   <span>Export CSV</span>
                 </button>
                 <button class="db-qa" onclick="tab('templates',null)">
-                  <div class="db-qa-icon" style="background:rgba(217,119,6,.1);color:#d97706">ðŸŽ¨</div>
+                  <div class="db-qa-icon" style="background:rgba(217,119,6,.1);color:#d97706">TPL</div>
                   <span>Templates</span>
                 </button>
               </div>
@@ -2501,11 +2567,11 @@ tr:hover .sp-flow{height:22px}
         <div style="display:flex;gap:9px;flex-wrap:wrap;align-items:center">
           <div style="display:flex;border:1px solid var(--border2);border-radius:8px;overflow:hidden">
             <button id="subs-view-btn" class="btn btn-s" onclick="setSubsView('list')" style="border-radius:0;border:none;background:rgba(245,166,35,.15);color:var(--accent)">â˜° List</button>
-            <button id="photos-view-btn" class="btn btn-s" onclick="setSubsView('photos')" style="border-radius:0;border:none;border-left:1px solid var(--border2)">ðŸ“· Photos</button>
+          <button id="photos-view-btn" class="btn btn-s" onclick="setSubsView('photos')" style="border-radius:0;border:none;border-left:1px solid var(--border2)">Photos</button>
           </div>
           <select class="fsel" id="f-status" onchange="renderSubs()"><option value="">All Status</option><option value="pending">Pending</option><option value="generated">Generated</option><option value="printed">Printed</option></select>
-          <button class="btn btn-s" onclick="exportCSV()">ðŸ“Š Export CSV</button>
-          <button class="btn btn-p" onclick="downloadAllPhotosZip()" title="One ZIP â€” each school in its own folder">ðŸ—œ All Photos ZIP</button>
+          <button class="btn btn-s" onclick="exportCSV()">Export CSV</button>
+          <button class="btn btn-p" onclick="downloadAllPhotosZip()" title="One ZIP - each school in its own folder">All Photos ZIP</button>
           <button class="btn btn-d" onclick="deleteStudentsForSchool()">Delete Org Students</button>
           <button class="btn btn-d" onclick="deleteAllStudents()">Delete All Students</button>
         </div>
@@ -2803,7 +2869,7 @@ tr:hover .sp-flow{height:22px}
       <div class="ph btwn"><div><h2>Orders & Payments</h2><p>Track all printing orders and revenue.</p></div>
         <button class="btn btn-p" onclick="openOrderModal()">+ New Order</button></div>
       <div class="sgrid" style="margin-bottom:22px">
-        <div class="scard sc-green"><div style="font-size:2rem">ðŸ’°</div><div><div class="scard-val" id="o-rev">â‚¹0</div><div class="scard-label">Revenue</div></div></div>
+        <div class="scard sc-green"><div style="font-size:1rem;font-weight:800;color:var(--green)">Rs</div><div><div class="scard-val" id="o-rev">Rs 0</div><div class="scard-label">Revenue</div></div></div>
         <div class="scard sc-blue"><div style="font-size:2rem">âœ…</div><div><div class="scard-val" id="o-paid">0</div><div class="scard-label">Paid</div></div></div>
         <div class="scard sc-orange"><div style="font-size:2rem">â³</div><div><div class="scard-val" id="o-pend">0</div><div class="scard-label">Pending</div></div></div>
       </div>
@@ -2829,7 +2895,7 @@ tr:hover .sp-flow{height:22px}
           <div style="display:flex;flex-direction:column;gap:13px">
             <div class="fg"><label>Card Width (mm)</label><input id="s-cw" type="number" value="85.6"></div>
             <div class="fg"><label>Card Height (mm)</label><input id="s-ch" type="number" value="54"></div>
-            <div class="fg"><label>Price per Card (â‚¹)</label><input id="s-pr" type="number" value="25"></div>
+            <div class="fg"><label>Price per Card (Rs)</label><input id="s-pr" type="number" value="25"></div>
             <button class="btn btn-p" onclick="saveSettings()">Save Defaults</button>
           </div>
         </div>
@@ -3946,7 +4012,7 @@ function renderHeader() {
   const total = state.submissions.length;
   const withPhoto = state.submissions.filter(s => s.has_photo).length;
   const icon = document.querySelector('.tb-ico');
-  if (icon) icon.textContent = school.type === 'College' ? 'ðŸŽ“' : school.type === 'Company' ? 'ðŸ¢' : 'ðŸ«';
+  if (icon) icon.textContent = school.type === 'College' ? 'COL' : school.type === 'Company' ? 'CO' : 'SCH';
   const name = document.querySelector('.tb-name');
   if (name) name.textContent = school.name || 'School Dashboard';
   const meta = document.querySelector('.tb-meta');
@@ -4250,7 +4316,7 @@ document.addEventListener('DOMContentLoaded', loadDashboard);
     <div class="m-body" style="display:flex;flex-direction:column;gap:13px">
       <div class="fg"><label>Client</label><select id="o-school"></select></div>
       <div class="fg"><label>Quantity</label><input id="o-qty" type="number" placeholder="500" oninput="calcTotal()"></div>
-      <div class="fg"><label>Price per Card (â‚¹)</label><input id="o-price" type="number" value="25" oninput="calcTotal()"></div>
+      <div class="fg"><label>Price per Card (Rs)</label><input id="o-price" type="number" value="25" oninput="calcTotal()"></div>
       <div class="fg"><label>Total Amount</label><input id="o-total" type="text" readonly placeholder="Auto"></div>
       <div class="fg"><label>Payment Status</label><select id="o-status"><option value="pending">Pending</option><option value="partial">Partial</option><option value="paid">Paid</option></select></div>
       <div class="fg"><label>Notes</label><textarea id="o-notes"></textarea></div>
@@ -4467,7 +4533,7 @@ function showClient() {
   loadClientSchools();
   // Reset school banner
   document.getElementById('c-school-name').textContent = 'Select your school below';
-  document.getElementById('c-school-ico').textContent = 'ðŸ«';
+  document.getElementById('c-school-ico').textContent = 'SCH';
 }
 function showPage(id) {
   document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
@@ -4677,7 +4743,7 @@ function showDemoMode() {
   ['s-schools','s-subs','s-gen','s-pend'].forEach(id => {
     const el = document.getElementById(id); if(el) el.textContent = '0';
   });
-  const rev = document.getElementById('s-rev'); if(rev) rev.textContent = 'â‚¹0';
+  const rev = document.getElementById('s-rev'); if(rev) rev.textContent = 'Rs 0';
 
   // Show persistent sticky banner
   if (!document.getElementById('_offline_banner')) {
@@ -4723,7 +4789,7 @@ async function loadStats() {
   document.getElementById('s-subs').textContent    = s.submissions;
   document.getElementById('s-gen').textContent     = s.generated;
   document.getElementById('s-pend').textContent    = s.pending;
-  document.getElementById('s-rev').textContent     = 'â‚¹' + s.revenue.toLocaleString();
+  document.getElementById('s-rev').textContent     = 'Rs ' + s.revenue.toLocaleString();
 }
 
 // â”€â”€ Dashboard â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -4745,9 +4811,9 @@ function renderDash() {
   list.innerHTML = recent.map(s => {
     const sc = schools.find(x=>x.id===s.school_id);
     return `<div class="r-item">
-      <div class="r-av">${s.photo_path?`<img src="${API()}/uploads/${s.photo_path.split('/').pop()}" onerror="this.parentElement.innerHTML='ðŸ‘¤'">` : 'ðŸ‘¤'}</div>
-      <div><div class="r-name">${s.name}</div><div class="r-meta">${s.unique_id||s.roll_no||'No ID'} â€¢ ${s.class_dept}</div></div>
-      <div class="r-right"><div style="font-size:.72rem">${sc?.name||'â€”'}</div><span class="badge ${badgeClass(s.status)}">${s.status}</span></div>
+      <div class="r-av">${s.photo_path?`<img src="${API()}/uploads/${s.photo_path.split('/').pop()}" onerror="this.parentElement.innerHTML='ID'">` : 'ID'}</div>
+      <div><div class="r-name">${s.name}</div><div class="r-meta">${s.unique_id||s.roll_no||'No ID'} - ${s.class_dept}</div></div>
+      <div class="r-right"><div style="font-size:.72rem">${sc?.name||'-'}</div><span class="badge ${badgeClass(s.status)}">${s.status}</span></div>
     </div>`;
   }).join('');
 }
@@ -5521,7 +5587,7 @@ function renderSubs() {
           <span style="background:${scColor};color:#fff;font-size:.75rem;font-weight:700;padding:3px 11px;border-radius:20px">${subs.length} student${subs.length===1?'':'s'}</span>
           <button class="btn btn-s" style="font-size:.72rem;padding:4px 10px" onclick="event.stopPropagation();openSchoolDashboard('${sid}')">ðŸ“Š Open Dashboard</button>
           <button class="btn btn-s" style="font-size:.72rem;padding:4px 10px" onclick="event.stopPropagation();exportSchoolCSV('${sid}')">ðŸ“Š Export</button>
-          <button class="btn btn-s" style="font-size:.72rem;padding:4px 10px" onclick="event.stopPropagation();downloadSchoolPhotosZip('${sid}','${scName}')">ðŸ“· Photos</button>
+          <button class="btn btn-s" style="font-size:.72rem;padding:4px 10px" onclick="event.stopPropagation();downloadSchoolPhotosZip('${sid}','${scName}')">Photos</button>
           <button class="btn btn-p" style="font-size:.72rem;padding:4px 10px" onclick="event.stopPropagation();openSchoolBundle('${sid}')">Bundle</button>
           <span class="chev" style="color:var(--text3);font-size:.8rem;transition:transform .2s">â–¼</span>
         </div>
@@ -5996,17 +6062,17 @@ function renderLinks() {
 // â”€â”€ Orders â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 function renderOrders() {
   const rev = orders.reduce((a,o)=>o.status==='paid'?a+o.total:a,0);
-  document.getElementById('o-rev').textContent = 'â‚¹'+rev.toLocaleString();
+  document.getElementById('o-rev').textContent = 'Rs '+rev.toLocaleString();
   document.getElementById('o-paid').textContent = orders.filter(o=>o.status==='paid').length;
   document.getElementById('o-pend').textContent = orders.filter(o=>o.status!=='paid').length;
-  if (document.getElementById('s-rev')) document.getElementById('s-rev').textContent = 'â‚¹'+rev.toLocaleString();
+  if (document.getElementById('s-rev')) document.getElementById('s-rev').textContent = 'Rs '+rev.toLocaleString();
   const tb = document.getElementById('orders-tbody');
   if (orders.length===0) { tb.innerHTML=`<tr><td colspan="7" style="text-align:center;padding:36px;color:var(--text3)">No orders yet</td></tr>`; return; }
   tb.innerHTML = orders.map((o,i)=>`<tr>
     <td>${i+1}</td>
     <td><strong>${o.client_name}</strong></td>
     <td>${o.qty?.toLocaleString()}</td>
-    <td><strong>â‚¹${o.total?.toLocaleString()}</strong></td>
+    <td><strong>Rs ${o.total?.toLocaleString()}</strong></td>
     <td><span class="badge ${badgeClass(o.status)}">${o.status}</span></td>
     <td style="font-size:.76rem;color:var(--text2)">${new Date(o.date||o.created_at||Date.now()).toLocaleDateString()}</td>
     <td><div class="act-row">
@@ -6029,7 +6095,7 @@ function openOrderModal() {
 function calcTotal() {
   const q = +document.getElementById('o-qty').value||0;
   const p = +document.getElementById('o-price').value||0;
-  document.getElementById('o-total').value = q&&p ? 'â‚¹'+(q*p).toLocaleString() : '';
+  document.getElementById('o-total').value = q&&p ? 'Rs '+(q*p).toLocaleString() : '';
 }
 async function saveOrder() {
   const qty = +document.getElementById('o-qty').value;
@@ -6718,7 +6784,7 @@ function populateTplSchoolSelect() {
   el.innerHTML = '<option value="">No school assigned</option>' + schools.map(s=>`<option value="${s.id}">${s.name}</option>`).join('');
 }
 function badgeClass(s) { return {pending:'bp',generated:'bg',printed:'bpr',paid:'bpr',partial:'bp',pending_pay:'bp'}[s]||'bp'; }
-function emoji(type) { return {School:'ðŸ«',College:'ðŸŽ“',Company:'ðŸ¢',Institution:'ðŸ›ï¸'}[type]||'ðŸ«'; }
+function emoji(type) { return {School:'SCH',College:'COL',Company:'CO',Institution:'INS'}[type]||'SCH'; }
 function timeAgo(ts) {
   if (!ts) return 'â€”';
   const d = Date.now()-new Date(ts).getTime();
@@ -7899,7 +7965,7 @@ window._injectorInit = false;
   const safe = v => (window.escHtml ? escHtml(v) : String(v??'').replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m])));
   const attr = v => (window.escAttr ? escAttr(v) : safe(v).replace(/`/g,'&#96;'));
   const num = v => Number(v || 0).toLocaleString('en-IN');
-  const money = v => 'â‚¹' + Number(v || 0).toLocaleString('en-IN');
+  const money = v => 'Rs ' + Number(v || 0).toLocaleString('en-IN');
   const todayKey = () => new Date().toISOString().slice(0,10);
   const subDate = s => String(s?.submitted_at || '').slice(0,10);
   const schoolOf = id => schools.find(s => s.id === id);
@@ -8198,8 +8264,8 @@ window._injectorInit = false;
     const grid = document.querySelector('.db-qa-grid'); if (!grid) return;
     if (!$('sp-qa-analytics')) {
       grid.insertAdjacentHTML('beforeend', `
-        <button class="db-qa" id="sp-qa-analytics" onclick="tab('analytics',null)"><div class="db-qa-icon" style="background:var(--blue-light);color:var(--blue)">â–¥</div><span>Analytics</span></button>
-        <button class="db-qa" onclick="tab('photo-review',null)"><div class="db-qa-icon" style="background:var(--green-light);color:var(--green)">â–£</div><span>Photo Review</span><b class="sp-count-badge" id="sp-photo-badge">0</b></button>
+        <button class="db-qa" id="sp-qa-analytics" onclick="tab('analytics',null)"><div class="db-qa-icon" style="background:var(--blue-light);color:var(--blue)">CHT</div><span>Analytics</span></button>
+        <button class="db-qa" onclick="tab('photo-review',null)"><div class="db-qa-icon" style="background:var(--green-light);color:var(--green)">PIC</div><span>Photo Review</span><b class="sp-count-badge" id="sp-photo-badge">0</b></button>
         <button class="db-qa" onclick="spShowShortcuts()"><div class="db-qa-icon" style="background:var(--amber-light);color:var(--amber)">?</div><span>Shortcuts</span></button>`);
     }
     const viewBtn = [...grid.querySelectorAll('.db-qa')].find(b => b.textContent.includes('View Data'));
@@ -8212,10 +8278,10 @@ window._injectorInit = false;
     const el = $('ops-list'); if (!el) return;
     const paid = orders.filter(o=>o.status==='paid').length;
     const rows = [
-      ['Photo Completion', withPhoto, total, 'var(--green)', 'â—‰'],
-      ['Cards Generated', generated, total, 'var(--blue)', 'â–£'],
-      ['Cards Printed', printed, total, 'var(--purple)', 'â–¤'],
-      ['Orders Paid', paid, orders.length, 'var(--teal,#0d9488)', 'â‚¹']
+      ['Photo Completion', withPhoto, total, 'var(--green)', '%'],
+      ['Cards Generated', generated, total, 'var(--blue)', 'ID'],
+      ['Cards Printed', printed, total, 'var(--purple)', 'PR'],
+      ['Orders Paid', paid, orders.length, 'var(--teal,#0d9488)', 'Rs']
     ];
     el.innerHTML = rows.map(([label,n,d,color,ico]) => {
       const pct = d ? Math.round(n/d*100) : 0;
@@ -8779,3 +8845,4 @@ window._injectorInit = false;
 })();
 </script>
 </body>
+
