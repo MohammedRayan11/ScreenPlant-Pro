@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Local app data and student/private files
+backend/screenplant.sqlite3
+backend/database.json
+backend/backups/
+backend/uploads/
+backend/generated/
+backend/templates_store/
+backups/
+uploads/
+generated/
+templates_store/
+
+# Local test/runtime scratch
+.e2e_tmp/
+__pycache_check/
+
+# Environment/secrets
+.env
+.env.*
+!.env.example
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.vscode/
+
+# Logs
+*.log
