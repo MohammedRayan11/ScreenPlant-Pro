@@ -8,6 +8,7 @@ export, and runtime admin password change support.
 """
 
 import os, json, uuid, zipfile, io, base64, binascii, csv, re, tempfile, difflib, shutil, sqlite3, threading, time, hmac, hashlib, logging, secrets, urllib.request, queue
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, date
 from functools import wraps
 from contextlib import closing
@@ -18,6 +19,7 @@ from PIL import Image, ImageDraw, ImageFont
 from reportlab.pdfgen import canvas as rl_canvas
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.units import mm
+from reportlab.lib.utils import ImageReader
 try:
     import openpyxl
     from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
@@ -255,6 +257,14 @@ DEFAULT_DB = {"schools": [], "submissions": [], "templates": [], "orders": [], "
 db_lock = threading.RLock()
 db_init_lock = threading.RLock()
 db_initialized = False
+font_cache = {}
+template_cache = {}
+generation_jobs = {}
+generation_jobs_lock = threading.RLock()
+generation_executor = ThreadPoolExecutor(
+    max_workers=max(1, int(os.environ.get('SCREENPLANT_GENERATION_WORKERS', '1'))),
+    thread_name_prefix='screenplant-gen'
+)
 rate_bucket = {}
 login_failures = {}   # ip -> {'count': int, 'locked_until': float}
 reset_otps = {}       # phone -> {'hash': str, 'expires': float, 'attempts': int}
@@ -877,6 +887,86 @@ def db_list_schools(public_only=True):
             school['submission_count'] = counts.get(school.get('id'), 0)
         return schools
 
+def db_get_submission(sub_id):
+    init_db()
+    if not sub_id:
+        return None
+    if not use_postgres():
+        with closing(sqlite_conn()) as conn:
+            row = conn.execute('SELECT data FROM screenplant_submissions WHERE id = ?', (sub_id,)).fetchone()
+            return json.loads(row[0]) if row else None
+    with closing(pg_conn()) as conn:
+        row = conn.execute('SELECT data FROM screenplant_submissions WHERE id = %s', (sub_id,)).fetchone()
+        return row[0] if row else None
+
+def db_update_submission(sub):
+    init_db()
+    sub_id = sub.get('id')
+    if not sub_id:
+        raise ValueError("Submission id is required")
+    now = datetime.now().isoformat()
+    if not use_postgres():
+        with closing(sqlite_conn()) as conn:
+            conn.execute(
+                '''
+                UPDATE screenplant_submissions
+                SET school_id = ?, unique_id = ?, name = ?, roll_no = ?, class_dept = ?,
+                    status = ?, submitted_at = ?, updated_at = ?, data = ?
+                WHERE id = ?
+                ''',
+                (
+                    sub.get('school_id', ''), sub.get('unique_id', ''), sub.get('name', ''),
+                    sub.get('roll_no', ''), sub.get('class_dept', ''), sub.get('status', ''),
+                    sub.get('submitted_at', ''), now, json.dumps(sub, default=str), sub_id
+                )
+            )
+            conn.commit()
+        return
+    _, _, Jsonb = pg_driver()
+    with closing(pg_conn()) as conn:
+        conn.execute(
+            '''
+            UPDATE screenplant_submissions
+            SET school_id = %s, unique_id = %s, name = %s, roll_no = %s, class_dept = %s,
+                status = %s, submitted_at = %s, updated_at = NOW()::TEXT, data = %s
+            WHERE id = %s
+            ''',
+            (
+                sub.get('school_id', ''), sub.get('unique_id', ''), sub.get('name', ''),
+                sub.get('roll_no', ''), sub.get('class_dept', ''), sub.get('status', ''),
+                sub.get('submitted_at', ''), Jsonb(sub), sub_id
+            )
+        )
+        conn.commit()
+
+def db_list_templates():
+    init_db()
+    if not use_postgres():
+        with closing(sqlite_conn()) as conn:
+            return [json.loads(row[0]) for row in conn.execute('SELECT data FROM screenplant_templates ORDER BY created_at, id').fetchall()]
+    with closing(pg_conn()) as conn:
+        return [row[0] for row in conn.execute('SELECT data FROM screenplant_templates ORDER BY created_at, id').fetchall()]
+
+def db_get_template_for_school(school_id):
+    init_db()
+    if not school_id:
+        return {}
+    if not use_postgres():
+        with closing(sqlite_conn()) as conn:
+            row = conn.execute('SELECT data FROM screenplant_templates WHERE school_id = ? ORDER BY created_at DESC, id DESC LIMIT 1', (school_id,)).fetchone()
+            return json.loads(row[0]) if row else {}
+    with closing(pg_conn()) as conn:
+        row = conn.execute('SELECT data FROM screenplant_templates WHERE school_id = %s ORDER BY created_at DESC, id DESC LIMIT 1', (school_id,)).fetchone()
+        return row[0] if row else {}
+
+def db_list_orders():
+    init_db()
+    if not use_postgres():
+        with closing(sqlite_conn()) as conn:
+            return [json.loads(row[0]) for row in conn.execute('SELECT data FROM screenplant_orders ORDER BY order_date, id').fetchall()]
+    with closing(pg_conn()) as conn:
+        return [row[0] for row in conn.execute('SELECT data FROM screenplant_orders ORDER BY order_date, id').fetchall()]
+
 def db_insert_submission(sub):
     init_db()
     if not use_postgres():
@@ -967,6 +1057,65 @@ def db_list_submissions(school_id='', status='', page=None, per_page=50):
             tuple(params)
         ).fetchall()
         return [row[0] for row in rows]
+
+def db_list_submissions_for_generation(school_id='', sub_ids=None):
+    init_db()
+    if sub_ids:
+        ids = [str(x) for x in sub_ids if str(x)]
+        if not ids:
+            return []
+        if not use_postgres():
+            placeholders = ','.join(['?'] * len(ids))
+            with closing(sqlite_conn()) as conn:
+                rows = conn.execute(
+                    f'SELECT data FROM screenplant_submissions WHERE id IN ({placeholders})',
+                    tuple(ids)
+                ).fetchall()
+                loaded = [json.loads(row[0]) for row in rows]
+                by_id = {sub.get('id'): sub for sub in loaded}
+        else:
+            with closing(pg_conn()) as conn:
+                rows = conn.execute(
+                    'SELECT data FROM screenplant_submissions WHERE id = ANY(%s)',
+                    (ids,)
+                ).fetchall()
+                by_id = {row[0].get('id'): row[0] for row in rows}
+        return [by_id[sub_id] for sub_id in ids if sub_id in by_id]
+    if not school_id:
+        return []
+    return db_list_submissions(school_id=school_id)
+
+def db_mark_submissions_generated(subs):
+    init_db()
+    if not subs:
+        return
+    now = datetime.now().isoformat()
+    for sub in subs:
+        sub['status'] = 'generated'
+    if not use_postgres():
+        with closing(sqlite_conn()) as conn:
+            conn.executemany(
+                '''
+                UPDATE screenplant_submissions
+                SET status = ?, updated_at = ?, data = ?
+                WHERE id = ?
+                ''',
+                [('generated', now, json.dumps(sub, default=str), sub.get('id')) for sub in subs]
+            )
+            conn.commit()
+        return
+    _, _, Jsonb = pg_driver()
+    with closing(pg_conn()) as conn:
+        with conn.cursor() as cur:
+            cur.executemany(
+                '''
+                UPDATE screenplant_submissions
+                SET status = %s, updated_at = NOW()::TEXT, data = %s
+                WHERE id = %s
+                ''',
+                [('generated', Jsonb(sub), sub.get('id')) for sub in subs]
+            )
+        conn.commit()
 
 def db_count_submissions(school_id='', status=''):
     init_db()
@@ -1413,6 +1562,7 @@ MAX_DOC_BYTES = 25 * 1024 * 1024
 MAX_ZIP_BYTES = 30 * 1024 * 1024
 MAX_ZIP_UNCOMPRESSED = 150 * 1024 * 1024
 MAX_ZIP_FILES = 1000
+MAX_BULK_GENERATION = int(os.environ.get('SCREENPLANT_MAX_BULK_GENERATION', '500'))
 STUDENT_SUBMISSION_LIMIT = max(1, int(os.environ.get('SCREENPLANT_STUDENT_SUBMISSION_LIMIT', '3')))
 IMAGE_EXTS = {'.jpg', '.jpeg', '.png', '.webp', '.bmp', '.tif', '.tiff'}
 IMAGE_MIMES = {'image/jpeg', 'image/png', 'image/webp'}
@@ -2202,8 +2352,7 @@ def delete_school_submissions(school_id):
 @app.route('/api/templates', methods=['GET'])
 @admin_required
 def get_templates():
-    db = load_db()
-    return jsonify(db.get('templates', []))
+    return jsonify(db_list_templates())
 
 @app.route('/api/templates', methods=['POST'])
 @admin_required
@@ -2660,8 +2809,7 @@ def submit_form():
 @app.route('/api/submissions/<sub_id>', methods=['GET'])
 @admin_required
 def get_submission(sub_id):
-    db = load_db()
-    sub = next((s for s in db['submissions'] if s['id'] == sub_id), None)
+    sub = db_get_submission(sub_id)
     if not sub:
         return jsonify({"error": "Not found"}), 404
     return jsonify(sub)
@@ -2670,8 +2818,7 @@ def get_submission(sub_id):
 @admin_required
 def patch_submission(sub_id):
     # [NEW] Partial submission editor for inline edits and detail modal edits.
-    db = load_db()
-    sub = next((s for s in db.get('submissions', []) if s.get('id') == sub_id), None)
+    sub = db_get_submission(sub_id)
     if not sub:
         return jsonify({"error": "Not found"}), 404
     data = request.json or {}
@@ -2696,7 +2843,7 @@ def patch_submission(sub_id):
             sub[key] = clean_text(value, 1000)
     if not sub.get('unique_id'):
         sub['unique_id'] = sub.get('roll_no') or sub.get('name') or sub.get('id')
-    save_db(db)
+    db_update_submission(sub)
     audit('submission.patch', f"id={sub_id}")
     return jsonify(sub)
 
@@ -2717,8 +2864,7 @@ def delete_submission(sub_id):
 @app.route('/api/submissions/<sub_id>/status', methods=['PATCH'])
 @admin_required
 def update_status(sub_id):
-    db = load_db()
-    sub = next((s for s in db['submissions'] if s['id'] == sub_id), None)
+    sub = db_get_submission(sub_id)
     if not sub:
         return jsonify({"error": "Not found"}), 404
     data = request.json or {}
@@ -2726,15 +2872,14 @@ def update_status(sub_id):
     if status not in ALLOWED_SUBMISSION_STATUSES:
         return jsonify({"error": "Invalid status"}), 400
     sub['status'] = status
-    save_db(db)
+    db_update_submission(sub)
     return jsonify(sub)
 
 @app.route('/api/submissions/<sub_id>/photo-status', methods=['PATCH'])
 @admin_required
 def update_photo_status(sub_id):
     # [NEW] Photo review state stored on the submission payload.
-    db = load_db()
-    sub = next((s for s in db.get('submissions', []) if s.get('id') == sub_id), None)
+    sub = db_get_submission(sub_id)
     if not sub:
         return jsonify({"error": "Not found"}), 404
     data = request.json or {}
@@ -2744,7 +2889,7 @@ def update_photo_status(sub_id):
     sub['photo_status'] = status
     if 'note' in data:
         sub['photo_rejection_note'] = clean_text(data.get('note'), 1000)
-    save_db(db)
+    db_update_submission(sub)
     audit('submission.photo_status', f"id={sub_id} status={status}")
     return jsonify(sub)
 
@@ -2828,6 +2973,9 @@ def mm_to_px(mm_val):
 
 def load_font(size=12, bold=False):
     """Try to load a system font, fall back to default."""
+    key = (int(size), bool(bold))
+    if key in font_cache:
+        return font_cache[key]
     font_names = [
         '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf' if bold else
         '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf',
@@ -2839,10 +2987,33 @@ def load_font(size=12, bold=False):
     for fn in font_names:
         if os.path.exists(fn):
             try:
-                return ImageFont.truetype(fn, size)
+                font_cache[key] = ImageFont.truetype(fn, size)
+                return font_cache[key]
             except OSError:
                 continue
-    return ImageFont.load_default()
+    font_cache[key] = ImageFont.load_default()
+    return font_cache[key]
+
+def template_base_image(tpl_path, width, height):
+    if not tpl_path or not os.path.exists(tpl_path):
+        return None
+    try:
+        mtime = os.path.getmtime(tpl_path)
+    except OSError:
+        return None
+    key = (tpl_path, int(width), int(height), mtime)
+    cached = template_cache.get(key)
+    if cached is not None:
+        return cached.copy()
+    try:
+        img = Image.open(tpl_path).convert('RGBA').resize((width, height), Image.LANCZOS)
+    except (OSError, ValueError) as e:
+        logger.warning("Template render failed for %s: %s", tpl_path, e)
+        return None
+    if len(template_cache) > 16:
+        template_cache.clear()
+    template_cache[key] = img
+    return img.copy()
 
 def hex_to_rgb(hex_color):
     h = hex_color.lstrip('#')
@@ -2870,8 +3041,9 @@ def generate_card_image(sub, school, style_cfg):
 
     # ── Base: use uploaded template image if exists ───────────────────────────
     tpl_path = style_cfg.get('template_path')
-    if tpl_path and os.path.exists(tpl_path):
-        card = Image.open(tpl_path).convert('RGBA').resize((W, H), Image.LANCZOS)
+    tpl_base = template_base_image(tpl_path, W, H)
+    if tpl_base is not None:
+        card = tpl_base
         draw = ImageDraw.Draw(card)
         # Overlay text fields from template field config
         fields_cfg = style_cfg.get('fields', {})
@@ -3117,12 +3289,11 @@ def card_to_bytes(img, fmt='JPEG', dpi=300):
 @app.route('/api/generate/preview/<sub_id>', methods=['GET'])
 @admin_required
 def preview_card(sub_id):
-    db    = load_db()
-    sub   = next((s for s in db['submissions'] if s['id'] == sub_id), None)
+    sub   = db_get_submission(sub_id)
     if not sub:
         return jsonify({"error": "Submission not found"}), 404
-    school = next((s for s in db['schools'] if s['id'] == sub.get('school_id')), {})
-    tpl    = next((t for t in db.get('templates',[]) if t.get('school_id') == sub.get('school_id')), {})
+    school = db_get_school(sub.get('school_id')) or {}
+    tpl    = db_get_template_for_school(sub.get('school_id'))
     style_cfg = {
         'template_path': tpl.get('file'),
         'color1':   tpl.get('color1') or school.get('color', '#1a73e8'),
@@ -3139,72 +3310,222 @@ def preview_card(sub_id):
 
 
 # ── Bulk generation: returns ZIP of JPEGs ─────────────────────────────────────
+def generation_style_config(school, tpl, style):
+    return {
+        'template_path': tpl.get('file'),
+        'color1': tpl.get('color1') or school.get('color', '#1a73e8'),
+        'color2': tpl.get('color2', '#ffffff'),
+        'text_color': '#ffffff',
+        'card_w_mm': tpl.get('card_w_mm', 85.6),
+        'card_h_mm': tpl.get('card_h_mm', 54),
+        'style': tpl.get('style') or style,
+        'fields': tpl.get('fields', {})
+    }
+
+def prepare_generation_request(data, force_fmt=None):
+    school_id = data.get('school_id', '')
+    style = data.get('style', 'classic')
+    fmt = (force_fmt or data.get('format', 'jpeg')).lower()
+    sub_ids = data.get('sub_ids') or data.get('ids') or None
+
+    if sub_ids:
+        subs = db_list_submissions_for_generation(sub_ids=sub_ids)
+        school_ids = {s.get('school_id') for s in subs}
+        if len(school_ids) > 1:
+            raise ValueError("Selected cards must belong to one school per PDF batch")
+        school_id = next(iter(school_ids), school_id) if school_ids else school_id
+    else:
+        subs = db_list_submissions_for_generation(school_id=school_id)
+    if not subs:
+        raise LookupError("No submissions found")
+    if len(subs) > MAX_BULK_GENERATION:
+        raise OverflowError(f"Too many cards at once ({len(subs)}). Export in batches of {MAX_BULK_GENERATION} using class/section filters.")
+
+    school = db_get_school(school_id) or {}
+    tpl = db_get_template_for_school(school_id)
+    return fmt, subs, school, generation_style_config(school, tpl, style)
+
+def render_generation_artifact(subs, school, style_cfg, fmt):
+    safe_school = safe_archive_name(school.get('name', 'cards'), 'cards')
+    if fmt == 'pdf':
+        buf = _generate_pdf(subs, school, style_cfg)
+        return buf, 'application/pdf', f"{safe_school}_{datetime.now().strftime('%Y%m%d')}.pdf"
+
+    zip_buf = io.BytesIO()
+    with zipfile.ZipFile(zip_buf, 'w', zipfile.ZIP_DEFLATED) as zf:
+        for sub in subs:
+            img = generate_card_image(sub, school, style_cfg)
+            ibuf = card_to_bytes(img)
+            stem = safe_archive_name(f"{sub.get('roll_no') or sub.get('unique_id') or 'card'}_{sub.get('name','')}", 'card')
+            zf.writestr(f"{stem}.jpg", ibuf.read())
+    zip_buf.seek(0)
+    return zip_buf, 'application/zip', f"{safe_school}_{datetime.now().strftime('%Y%m%d')}.zip"
+
+def generation_job_snapshot(job):
+    return {
+        "id": job.get("id"),
+        "status": job.get("status"),
+        "progress": job.get("progress", 0),
+        "message": job.get("message", ""),
+        "download_ready": bool(job.get("path") and job.get("status") == "done"),
+        "filename": job.get("filename", ""),
+        "created_at": job.get("created_at", ""),
+        "finished_at": job.get("finished_at", ""),
+    }
+
+def generation_job_state_path(job_id):
+    return os.path.join(GENERATED_DIR, f"{secure_filename(job_id)}.json")
+
+def write_generation_job(job):
+    job_id = job.get('id')
+    if not job_id:
+        return
+    generation_jobs[job_id] = dict(job)
+    path = generation_job_state_path(job_id)
+    tmp_path = path + '.tmp'
+    with open(tmp_path, 'w', encoding='utf-8') as f:
+        json.dump(job, f, default=str)
+    os.replace(tmp_path, path)
+
+def read_generation_job(job_id):
+    with generation_jobs_lock:
+        if job_id in generation_jobs:
+            return dict(generation_jobs[job_id])
+    path = generation_job_state_path(job_id)
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            job = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+    with generation_jobs_lock:
+        generation_jobs[job_id] = dict(job)
+    return job
+
+def update_generation_job(job_id, **changes):
+    with generation_jobs_lock:
+        job = generation_jobs.get(job_id) or read_generation_job(job_id) or {"id": job_id}
+        job.update(changes)
+        write_generation_job(job)
+        return dict(job)
+
+def cleanup_generation_jobs():
+    cutoff = time.time() - int(os.environ.get('SCREENPLANT_GENERATION_JOB_TTL_SECONDS', '3600'))
+    with generation_jobs_lock:
+        stale_ids = [
+            job_id for job_id, job in generation_jobs.items()
+            if job.get('finished_epoch', job.get('created_epoch', 0)) < cutoff
+        ]
+        for job_id in stale_ids:
+            path = generation_jobs[job_id].get('path')
+            if path and os.path.exists(path):
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+            state_path = generation_job_state_path(job_id)
+            if os.path.exists(state_path):
+                try:
+                    os.remove(state_path)
+                except OSError:
+                    pass
+            generation_jobs.pop(job_id, None)
+
+def run_generation_job(job_id, data):
+    try:
+        update_generation_job(job_id, status='running', progress=5, message='Preparing cards')
+        fmt, subs, school, style_cfg = prepare_generation_request(data)
+        update_generation_job(job_id, progress=15, message=f"Rendering {len(subs)} cards")
+        buf, mimetype, filename = render_generation_artifact(subs, school, style_cfg, fmt)
+        out_path = os.path.join(GENERATED_DIR, f"{job_id}_{secure_filename(filename)}")
+        with open(out_path, 'wb') as f:
+            f.write(buf.getvalue())
+        db_mark_submissions_generated(subs)
+        update_generation_job(
+            job_id,
+            status='done',
+            progress=100,
+            message='Ready to download',
+            path=out_path,
+            mimetype=mimetype,
+            filename=filename,
+            finished_at=datetime.now().isoformat(),
+            finished_epoch=time.time(),
+        )
+    except Exception as e:
+        logger.exception("Generation job %s failed: %s", job_id, e)
+        update_generation_job(
+            job_id,
+            status='error',
+            progress=100,
+            message=str(e),
+            finished_at=datetime.now().isoformat(),
+            finished_epoch=time.time(),
+        )
+
+@app.route('/api/generate/jobs', methods=['POST'])
+@admin_required
+def create_generation_job():
+    cleanup_generation_jobs()
+    data = request.json or {}
+    job_id = gen_id('gen_')
+    with generation_jobs_lock:
+        job = {
+            "id": job_id,
+            "status": "queued",
+            "progress": 0,
+            "message": "Queued",
+            "created_at": datetime.now().isoformat(),
+            "created_epoch": time.time(),
+        }
+        write_generation_job(job)
+    generation_executor.submit(run_generation_job, job_id, data)
+    return jsonify(generation_job_snapshot(job)), 202
+
+@app.route('/api/generate/jobs/<job_id>', methods=['GET'])
+@admin_required
+def get_generation_job(job_id):
+    job = read_generation_job(job_id)
+    if not job:
+        return jsonify({"error": "Generation job not found"}), 404
+    return jsonify(generation_job_snapshot(job))
+
+@app.route('/api/generate/jobs/<job_id>/download', methods=['GET'])
+@admin_required
+def download_generation_job(job_id):
+    job = read_generation_job(job_id)
+    if not job:
+        return jsonify({"error": "Generation job not found"}), 404
+    if job.get('status') != 'done' or not job.get('path'):
+        return jsonify({"error": "Generation is not ready yet"}), 409
+    path = job.get('path')
+    mimetype = job.get('mimetype', 'application/octet-stream')
+    filename = job.get('filename', os.path.basename(path))
+    return send_file(path, mimetype=mimetype, download_name=filename, as_attachment=True)
+
 @app.route('/api/generate/bulk', methods=['POST'])
 @admin_required
 def bulk_generate():
+    return bulk_generate_response()
+
+def bulk_generate_response(force_fmt=None):
     """
     Body: { school_id, style, format: "jpeg"|"pdf", sub_ids: [] (optional) }
     Returns: ZIP file with one image per card (or one PDF)
     """
-    data      = request.json or {}
-    school_id = data.get('school_id','')
-    style     = data.get('style', 'classic')
-    fmt       = data.get('format', 'jpeg').lower()
-    sub_ids   = data.get('sub_ids') or data.get('ids') or None
-    db        = load_db()
-
-    if sub_ids:
-        wanted = {str(x) for x in sub_ids}
-        subs = [s for s in db['submissions'] if s.get('id') in wanted]
-        school_ids = {s.get('school_id') for s in subs}
-        if len(school_ids) > 1:
-            return jsonify({"error": "Selected cards must belong to one school per PDF batch"}), 400
-        school_id = next(iter(school_ids), school_id) if school_ids else school_id
-    else:
-        subs = [s for s in db['submissions'] if s.get('school_id') == school_id]
-    if not subs:
+    try:
+        fmt, subs, school, style_cfg = prepare_generation_request(request.json or {}, force_fmt)
+    except LookupError:
         return jsonify({"error": "No submissions found"}), 404
-    # Safety cap: generating 1000+ cards at once can exhaust server RAM.
-    MAX_BULK = 500
-    if len(subs) > MAX_BULK:
-        return jsonify({"error": f"Too many cards at once ({len(subs)}). Export in batches of {MAX_BULK} using class/section filters."}), 400
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    except OverflowError as e:
+        return jsonify({"error": str(e)}), 400
 
-    school = next((s for s in db['schools'] if s['id'] == school_id), {})
-    tpl    = next((t for t in db.get('templates',[]) if t.get('school_id') == school_id), {})
-    style_cfg = {
-        'template_path': tpl.get('file'),
-        'color1':   tpl.get('color1') or school.get('color', '#1a73e8'),
-        'color2':   tpl.get('color2', '#ffffff'),
-        'text_color': '#ffffff',
-        'card_w_mm': tpl.get('card_w_mm', 85.6),
-        'card_h_mm': tpl.get('card_h_mm', 54),
-        'style':    tpl.get('style') or style,
-        'fields':   tpl.get('fields', {})
-    }
-
-    if fmt == 'pdf':
-        # Build a PDF with one card per page
-        buf = _generate_pdf(subs, school, style_cfg)
-        # Mark all as generated
-        for sub in subs:
-            sub['status'] = 'generated'
-        save_db(db)
-        return send_file(buf, mimetype='application/pdf',
-                         download_name=f"{school.get('name','cards')}_{datetime.now().strftime('%Y%m%d')}.pdf")
-    else:
-        # ZIP of JPEGs
-        zip_buf = io.BytesIO()
-        with zipfile.ZipFile(zip_buf, 'w', zipfile.ZIP_DEFLATED) as zf:
-            for sub in subs:
-                img  = generate_card_image(sub, school, style_cfg)
-                ibuf = card_to_bytes(img)
-                fname = f"{sub.get('roll_no','unknown')}_{sub.get('name','').replace(' ','_')}.jpg"
-                zf.writestr(fname, ibuf.read())
-                sub['status'] = 'generated'
-        save_db(db)
-        zip_buf.seek(0)
-        return send_file(zip_buf, mimetype='application/zip',
-                         download_name=f"{school.get('name','cards')}_{datetime.now().strftime('%Y%m%d')}.zip")
+    buf, mimetype, filename = render_generation_artifact(subs, school, style_cfg, fmt)
+    db_mark_submissions_generated(subs)
+    return send_file(buf, mimetype=mimetype, download_name=filename)
 
 
 def _generate_pdf(subs, school, style_cfg):
@@ -3223,49 +3544,35 @@ def _generate_pdf(subs, school, style_cfg):
     rows_per_page = int((page_h - 2*margin + gap) / (card_h + gap))
     cards_per_page = cols * rows_per_page
 
-    tmp_files = []
-    try:
-        for idx, sub in enumerate(subs):
-            pos_in_page = idx % cards_per_page
-            col = pos_in_page % cols
-            row = pos_in_page // cols
+    for idx, sub in enumerate(subs):
+        pos_in_page = idx % cards_per_page
+        col = pos_in_page % cols
+        row = pos_in_page // cols
 
-            if pos_in_page == 0 and idx > 0:
-                c.showPage()
+        if pos_in_page == 0 and idx > 0:
+            c.showPage()
 
-            x = margin + col * (card_w + gap)
-            y = page_h - margin - (row + 1) * card_h - row * gap
+        x = margin + col * (card_w + gap)
+        y = page_h - margin - (row + 1) * card_h - row * gap
 
-            # Generate card image, convert to temp file for ReportLab
-            img  = generate_card_image(sub, school, style_cfg)
-            ibuf = card_to_bytes(img)
-            tmp_path = os.path.join(GENERATED_DIR, f"tmp_{sub['id']}.jpg")
-            tmp_files.append(tmp_path)
-            with open(tmp_path, 'wb') as f:
-                f.write(ibuf.read())
+        img = generate_card_image(sub, school, style_cfg)
+        ibuf = card_to_bytes(img, fmt='JPEG', dpi=CARD_DPI)
+        c.drawImage(ImageReader(ibuf), x, y, width=card_w, height=card_h)
 
-            c.drawImage(tmp_path, x, y, width=card_w, height=card_h)
+        # Crop marks (helpful for cutting)
+        c.setStrokeColorRGB(0.7, 0.7, 0.7)
+        c.setLineWidth(0.3)
+        mark = 3 * mm
+        c.line(x - mark, y + card_h, x, y + card_h)
+        c.line(x, y + card_h + mark, x, y + card_h)
+        c.line(x + card_w, y + card_h, x + card_w + mark, y + card_h)
+        c.line(x + card_w, y + card_h + mark, x + card_w, y + card_h)
+        c.line(x - mark, y, x, y)
+        c.line(x, y - mark, x, y)
+        c.line(x + card_w, y, x + card_w + mark, y)
+        c.line(x + card_w, y - mark, x + card_w, y)
 
-            # Crop marks (helpful for cutting)
-            c.setStrokeColorRGB(0.7, 0.7, 0.7)
-            c.setLineWidth(0.3)
-            mark = 3 * mm
-            c.line(x - mark, y + card_h, x, y + card_h)
-            c.line(x, y + card_h + mark, x, y + card_h)
-            c.line(x + card_w, y + card_h, x + card_w + mark, y + card_h)
-            c.line(x + card_w, y + card_h + mark, x + card_w, y + card_h)
-            c.line(x - mark, y, x, y)
-            c.line(x, y - mark, x, y)
-            c.line(x + card_w, y, x + card_w + mark, y)
-            c.line(x + card_w, y - mark, x + card_w, y)
-
-        c.save()
-    finally:
-        # Always clean up temp files whether or not an exception occurred
-        for p in tmp_files:
-            if os.path.exists(p):
-                try: os.remove(p)
-                except OSError: pass
+    c.save()
     buf.seek(0)
     return buf
 
@@ -3281,7 +3588,7 @@ def generate_sheet():
 @admin_required
 def generate_batch_pdf():
     # [NEW] Backward-compatible alias used by the enhanced Generate tab.
-    return bulk_generate()
+    return bulk_generate_response(force_fmt='pdf')
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -3366,8 +3673,7 @@ def export_csv():
 @app.route('/api/orders', methods=['GET'])
 @admin_required
 def get_orders():
-    db = load_db()
-    return jsonify(db.get('orders', []))
+    return jsonify(db_list_orders())
 
 @app.route('/api/orders', methods=['POST'])
 @admin_required
@@ -4908,4 +5214,5 @@ if __name__ == '__main__':
     print("  Admin: http://localhost:5000")
     print("="*50 + "\n")
     app.run(debug=os.environ.get('FLASK_DEBUG') == '1', port=parse_int(os.environ.get('PORT'), 5000, 1, 65535), use_reloader=False)
+
 
