@@ -1679,6 +1679,399 @@ tr:hover .sp-flow{height:22px}
 .skeleton{background:linear-gradient(90deg,var(--bg4) 25%,var(--bg3) 50%,var(--bg4) 75%);background-size:200% 100%;animation:skeleton-shimmer 1.5s infinite;color:transparent!important;border-radius:8px}
 @keyframes skeleton-shimmer{0%{background-position:200% 0}100%{background-position:-200% 0}}
 @media(max-width:900px){.sp-analytics-grid{grid-template-columns:1fr}.sp-bulk-bar{left:12px;right:12px;transform:translateY(120%);flex-wrap:wrap}.sp-bulk-bar.on{transform:translateY(0)}}
+
+/* ════════════════════════════════════════════════════════════
+   MOBILE UI OVERHAUL — ScreenPlant Pro
+   Full mobile-first redesign for screens ≤768px
+   ════════════════════════════════════════════════════════════ */
+
+/* ─── MOBILE BOTTOM NAV ─────────────────────────────────────────────────── */
+.mob-nav {
+  display: none;
+  position: fixed;
+  bottom: 0; left: 0; right: 0;
+  z-index: 400;
+  background: rgba(255,255,255,0.95);
+  backdrop-filter: blur(20px) saturate(180%);
+  -webkit-backdrop-filter: blur(20px) saturate(180%);
+  border-top: 1px solid var(--border);
+  padding: 0 0 env(safe-area-inset-bottom, 0);
+  box-shadow: 0 -8px 40px rgba(18,21,43,0.10);
+}
+[data-theme="dark"] .mob-nav {
+  background: rgba(23, 27, 46, 0.97);
+  border-top-color: var(--border);
+}
+.mob-nav-inner {
+  display: flex;
+  align-items: stretch;
+  height: 62px;
+}
+.mob-nav-item {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 3px;
+  background: none;
+  border: none;
+  cursor: pointer;
+  color: var(--text3);
+  font-family: var(--fb);
+  font-size: 0.6rem;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  padding: 6px 4px;
+  transition: all 0.18s cubic-bezier(0.4,0,0.2,1);
+  position: relative;
+  -webkit-tap-highlight-color: transparent;
+}
+.mob-nav-item.active {
+  color: var(--accent);
+}
+.mob-nav-item.active .mob-nav-ico {
+  background: var(--accent-light);
+  transform: translateY(-2px) scale(1.08);
+}
+.mob-nav-ico {
+  width: 40px; height: 28px;
+  display: flex; align-items: center; justify-content: center;
+  border-radius: 14px;
+  transition: all 0.2s cubic-bezier(0.34,1.56,0.64,1);
+}
+.mob-nav-item:active .mob-nav-ico {
+  transform: scale(0.9);
+}
+.mob-nav-label { line-height: 1; }
+.mob-nav-badge {
+  position: absolute; top: 6px; right: calc(50% - 24px);
+  min-width: 16px; height: 16px;
+  background: var(--accent); color: #fff;
+  font-size: 0.6rem; font-weight: 800;
+  border-radius: 99px; padding: 0 4px;
+  display: flex; align-items: center; justify-content: center;
+  border: 2px solid var(--bg2);
+  display: none;
+}
+.mob-nav-badge.on { display: flex; }
+.mob-nav-fab {
+  position: fixed;
+  bottom: 80px; right: 20px;
+  width: 52px; height: 52px;
+  background: linear-gradient(135deg, #ff7c43, #e84a10);
+  border: none; border-radius: 16px;
+  color: #fff; font-size: 1.4rem;
+  display: none; align-items: center; justify-content: center;
+  cursor: pointer;
+  box-shadow: 0 8px 24px rgba(255,107,43,0.45), 0 2px 8px rgba(255,107,43,0.25);
+  z-index: 390;
+  transition: all 0.2s cubic-bezier(0.34,1.56,0.64,1);
+  -webkit-tap-highlight-color: transparent;
+}
+.mob-nav-fab:active { transform: scale(0.92); }
+
+/* ─── MOBILE TOPBAR ─────────────────────────────────────────────────────── */
+@media(max-width:768px) {
+  /* Show bottom nav & FAB */
+  .mob-nav, .mob-nav-fab { display: flex; }
+
+  /* Core layout */
+  .sidebar { transform: translateX(-110%); box-shadow: none; }
+  .sidebar.open {
+    transform: translateX(0);
+    box-shadow: 0 0 0 100vmax rgba(8,10,20,0.45);
+  }
+  .main { margin-left: 0 !important; padding-bottom: 62px; }
+
+  /* Topbar mobile */
+  .topbar {
+    height: 56px;
+    padding: 0 14px;
+    gap: 10px;
+    background: rgba(255,255,255,0.96);
+    backdrop-filter: blur(20px) saturate(180%);
+    -webkit-backdrop-filter: blur(20px) saturate(180%);
+  }
+  [data-theme="dark"] .topbar { background: rgba(23,27,46,0.97); }
+  .topbar-title { font-size: 1.05rem; }
+
+  /* Hide "Student Portal" button label, keep icon */
+  .topbar-right .btn-a span { display: none; }
+  .topbar-right .btn-a {
+    padding: 0;
+    width: 36px; height: 36px;
+    border-radius: 10px;
+    justify-content: center;
+  }
+  .topbar-right .btn-a svg { width: 16px; height: 16px; }
+
+  /* Tab content padding */
+  .tab-c { padding: 14px 14px 80px !important; }
+
+  /* Page header on mobile */
+  .ph h2 { font-size: 1.3rem; }
+  .ph p { font-size: 0.82rem; }
+  .ph.btwn { flex-direction: column; gap: 10px; }
+  .ph.btwn > * { width: 100%; }
+
+  /* ─── DASHBOARD HERO (mobile) ─────────────────────────────────────────── */
+  .db-hero { min-height: auto; border-radius: 0; }
+  .db-hero-inner { padding: 20px 16px 22px; }
+  .db-hero-title { font-size: 1.6rem !important; }
+  .db-hero-sub { font-size: 0.82rem !important; }
+  .db-hero-left { gap: 10px !important; }
+  .db-hero-btns { flex-direction: column; gap: 8px !important; }
+  .db-btn-primary, .db-btn-ghost {
+    width: 100%; justify-content: center;
+    padding: 12px 18px !important;
+    font-size: 0.85rem !important;
+  }
+  .db-hero-right { display: none; } /* hide ring on mobile to save space */
+
+  /* ─── MOBILE KPI STRIP ───────────────────────────────────────────────── */
+  .db-kpi-strip {
+    grid-template-columns: 1fr 1fr !important;
+    gap: 10px !important;
+    padding: 0 14px 14px !important;
+  }
+  .db-kpi {
+    padding: 14px 14px !important;
+    border-radius: 14px !important;
+  }
+  .db-kpi-val { font-size: 1.55rem !important; }
+  .db-kpi-label { font-size: 0.7rem !important; }
+  .db-kpi-ico { width: 36px !important; height: 36px !important; font-size: 1rem !important; }
+
+  /* ─── FOCUS ITEMS ────────────────────────────────────────────────────── */
+  .db-focus-row { flex-direction: column; gap: 10px !important; padding: 0 14px 14px !important; }
+  .db-focus-item { padding: 14px 16px !important; border-radius: 14px !important; }
+
+  /* ─── PANEL CARDS ────────────────────────────────────────────────────── */
+  .db-panel { border-radius: 14px !important; }
+  .db-panel-hdr { padding: 14px 16px !important; }
+  .db-panel-body { padding: 8px !important; }
+
+  /* ─── SCHOOLS GRID ───────────────────────────────────────────────────── */
+  .schools-grid { grid-template-columns: 1fr 1fr; gap: 10px; }
+  .sc { padding: 14px 14px; border-radius: 14px; }
+  .sc-name { font-size: 0.88rem; }
+  .sc-stats { gap: 8px; }
+
+  /* ─── STAT CARDS ─────────────────────────────────────────────────────── */
+  .sgrid { grid-template-columns: 1fr 1fr; gap: 10px; }
+  .scard { padding: 14px; border-radius: 12px; }
+  .scard-val { font-size: 1.5rem; }
+  .scard-label { font-size: 0.7rem; }
+
+  /* ─── HERO BOARD ─────────────────────────────────────────────────────── */
+  .hero-board { grid-template-columns: 1fr !important; padding: 18px !important; border-radius: 16px; }
+  .hero-panel { margin-top: 0; }
+  .hero-board h1 { font-size: 1.6rem !important; }
+
+  /* ─── FOCUS STRIP ────────────────────────────────────────────────────── */
+  .focus-strip { grid-template-columns: 1fr !important; gap: 10px; }
+
+  /* ─── SUBMISSIONS TABLE ──────────────────────────────────────────────── */
+  .sp-table-wrap { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+  .sp-table-wrap table { min-width: 600px; }
+
+  /* ─── SEARCH BAR ─────────────────────────────────────────────────────── */
+  .sbar { height: 44px; border-radius: 12px; }
+
+  /* ─── MODAL SIZING ───────────────────────────────────────────────────── */
+  .modal-box {
+    width: calc(100vw - 24px) !important;
+    max-width: 100% !important;
+    max-height: 92vh;
+    overflow-y: auto;
+    border-radius: 20px !important;
+    margin: auto;
+  }
+  .modal-hdr { padding: 16px 18px !important; }
+  .modal-body { padding: 16px 18px !important; }
+  .modal-foot { padding: 12px 18px !important; flex-direction: column; gap: 8px; }
+  .modal-foot .btn { width: 100%; justify-content: center; }
+
+  /* ─── FORM (client portal) ───────────────────────────────────────────── */
+  .client-body { padding: 16px 14px 80px !important; }
+  .grid2 { grid-template-columns: 1fr !important; gap: 12px !important; }
+  .photo-row { flex-direction: column; gap: 14px; }
+  .photo-box { width: 100%; max-width: 160px; height: 140px; margin: 0 auto; }
+  .form-card { padding: 18px 16px !important; border-radius: 16px !important; }
+  .school-banner { padding: 16px !important; border-radius: 14px !important; gap: 12px !important; }
+
+  /* ─── LINKS LIST ─────────────────────────────────────────────────────── */
+  .li { flex-direction: column; gap: 12px; padding: 14px; border-radius: 14px; }
+  .li-act { flex-wrap: wrap; gap: 8px; }
+  .li-act .btn { flex: 1; min-width: 80px; justify-content: center; font-size: 0.78rem; padding: 8px 10px; }
+  .li-info { gap: 4px; }
+  .li-url { font-size: 0.72rem; word-break: break-all; }
+
+  /* ─── ORDERS TABLE ───────────────────────────────────────────────────── */
+  .tab-c table { font-size: 0.78rem; }
+  .tab-c table th, .tab-c table td { padding: 10px 8px !important; }
+
+  /* ─── EXPORT HERO ────────────────────────────────────────────────────── */
+  .export-hero { grid-template-columns: 1fr !important; padding: 18px !important; border-radius: 16px !important; }
+  .export-grid { grid-template-columns: 1fr !important; }
+  .export-stats { grid-template-columns: 1fr 1fr !important; }
+
+  /* ─── COMMAND PALETTE ────────────────────────────────────────────────── */
+  .sp-overlay { padding: 0 !important; align-items: flex-end !important; }
+  .sp-cmd { width: 100% !important; border-radius: 24px 24px 0 0 !important; max-height: 82vh; }
+  .sp-cmd-list { max-height: 55vh; }
+
+  /* ─── FORM BUILDER LAYOUT ────────────────────────────────────────────── */
+  .fb-layout { grid-template-columns: 1fr !important; height: auto !important; overflow: visible !important; }
+
+  /* ─── QUICK ACTIONS ──────────────────────────────────────────────────── */
+  .qa-grid { grid-template-columns: 1fr 1fr; gap: 8px; }
+  .qa { padding: 12px; min-height: 80px; font-size: 0.78rem; }
+
+  /* ─── ANALYTICS GRID ─────────────────────────────────────────────────── */
+  .sp-analytics-grid { grid-template-columns: 1fr !important; }
+  .sp-kpi-strip { grid-template-columns: 1fr 1fr !important; }
+
+  /* ─── PHOTO REVIEW ───────────────────────────────────────────────────── */
+  .sp-photo-grid { grid-template-columns: repeat(auto-fill, minmax(110px, 1fr)) !important; gap: 8px !important; }
+  .sp-review-card { height: 160px !important; }
+
+  /* ─── TOAST POSITION ─────────────────────────────────────────────────── */
+  .toast { right: 12px !important; bottom: 76px !important; max-width: calc(100vw - 24px) !important; }
+  .sp-toast-stack { right: 12px !important; bottom: 76px !important; }
+
+  /* ─── BULK ACTION BAR ────────────────────────────────────────────────── */
+  .sp-bulk-bar { bottom: 76px !important; left: 12px !important; right: 12px !important; border-radius: 14px !important; }
+
+  /* ─── SETTINGS PAGE ──────────────────────────────────────────────────── */
+  .settings-grid { grid-template-columns: 1fr !important; }
+
+  /* ─── NOTIF PANEL ────────────────────────────────────────────────────── */
+  .notif-panel { width: calc(100vw - 24px) !important; right: -8px !important; }
+
+  /* Hide sidebar overlay toggle helper */
+  .sidebar-backdrop { display: block; }
+}
+
+/* ─── VERY SMALL SCREENS (≤420px) ───────────────────────────────────────── */
+@media(max-width:420px) {
+  .schools-grid { grid-template-columns: 1fr !important; }
+  .sgrid { grid-template-columns: 1fr 1fr !important; }
+  .db-kpi-strip { grid-template-columns: 1fr 1fr !important; }
+  .mob-nav-label { font-size: 0.56rem; }
+  .tab-c { padding: 12px 12px 80px !important; }
+  .db-hero-title { font-size: 1.4rem !important; }
+}
+
+/* ─── MOBILE LOGIN ENHANCEMENTS ─────────────────────────────────────────── */
+@media(max-width:768px) {
+  #pg-login { padding: 0; }
+  .login-wrap { padding: 20px 16px 40px; gap: 18px; }
+  .login-card { padding: 24px 20px; border-radius: 20px; }
+  .login-card h1 { font-size: 1.55rem; }
+  .brand { font-size: 1.35rem; }
+  .brand-hex { width: 34px; height: 34px; font-size: 1rem; border-radius: 9px; }
+  #pg-login::before, #pg-login::after { display: none; } /* clean mobile login */
+}
+
+/* ─── MOBILE CLIENT PORTAL ──────────────────────────────────────────────── */
+@media(max-width:768px) {
+  .client-hdr { padding: 10px 16px; }
+  .school-banner {
+    flex-direction: row;
+    align-items: center;
+  }
+  .school-icon-lg { font-size: 2rem !important; }
+  .sbn { font-size: 1rem !important; }
+  .sbs { font-size: 0.78rem !important; }
+  .school-sel-top { flex-direction: column; align-items: stretch; gap: 8px; border-radius: 14px; }
+  #sig-canvas { height: 80px; }
+  .c-gate-continue { margin-top: 8px; }
+}
+
+/* ─── MOBILE SCROLL IMPROVEMENTS ───────────────────────────────────────── */
+@media(max-width:768px) {
+  .main { overflow-y: auto; -webkit-overflow-scrolling: touch; scroll-behavior: smooth; }
+  .tab-c { animation: none; } /* disable stagger on mobile for perf */
+
+  /* Better touch targets */
+  .nav-i { padding: 12px 14px; font-size: 0.9rem; }
+  .btn { min-height: 40px; }
+  .btn-lg { min-height: 48px; }
+
+  /* Smooth pill tabs */
+  .sp-toolbar { overflow-x: auto; flex-wrap: nowrap; padding-bottom: 4px; -webkit-overflow-scrolling: touch; }
+  .sp-chip { white-space: nowrap; flex-shrink: 0; }
+
+  /* Card micro-adjustments */
+  .card-box { padding: 16px; border-radius: 14px; }
+  .card-box h3 { font-size: 0.9rem; }
+  .r-item { padding: 10px; }
+
+  /* Tighter page headers */
+  .ph { margin-bottom: 16px; }
+}
+
+/* ─── SIDEBAR BACKDROP ──────────────────────────────────────────────────── */
+.mob-sidebar-backdrop {
+  display: none;
+  position: fixed; inset: 0;
+  background: rgba(8,10,20,0.5);
+  backdrop-filter: blur(4px);
+  z-index: 195;
+  animation: fi 0.18s ease;
+}
+.mob-sidebar-backdrop.on { display: block; }
+
+/* ─── MOBILE PULL-TO-REFRESH INDICATOR ─────────────────────────────────── */
+.mob-ptr {
+  position: fixed; top: 0; left: 50%; transform: translateX(-50%);
+  background: var(--accent); color: #fff;
+  width: 40px; height: 40px; border-radius: 50%;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 1.1rem; z-index: 500;
+  transition: all 0.2s ease;
+  opacity: 0; transform: translateX(-50%) translateY(-50px) scale(0.8);
+}
+.mob-ptr.visible {
+  opacity: 1; transform: translateX(-50%) translateY(60px) scale(1);
+}
+
+/* ─── MOBILE SWIPE HINT (first visit) ──────────────────────────────────── */
+.mob-swipe-hint {
+  display: none;
+  position: fixed; bottom: 72px; left: 50%; transform: translateX(-50%);
+  background: var(--text); color: #fff;
+  padding: 8px 16px; border-radius: 99px;
+  font-size: 0.75rem; font-weight: 600;
+  z-index: 380; white-space: nowrap;
+  animation: fu 0.3s ease, fadeOut 0.3s ease 2.5s both;
+}
+@keyframes fadeOut { to { opacity: 0; transform: translateX(-50%) translateY(10px); } }
+
+/* ─── DARK MODE MOBILE TWEAKS ───────────────────────────────────────────── */
+@media(max-width:768px) {
+  [data-theme="dark"] .topbar {
+    background: rgba(15,18,33,0.97);
+    border-bottom-color: var(--border);
+  }
+  [data-theme="dark"] .mob-nav {
+    background: rgba(15,18,33,0.97);
+  }
+  [data-theme="dark"] .login-card {
+    background: var(--bg2);
+    border-color: var(--border);
+  }
+}
+
+/* ─── SMOOTH MOBILE SIDEBAR CLOSE ──────────────────────────────────────── */
+@media(max-width:768px) {
+  .sidebar {
+    transition: transform 0.28s cubic-bezier(0.4,0,0.2,1), box-shadow 0.28s ease;
+    will-change: transform;
+  }
+}
 </style>
 </head>
 <body>
@@ -3797,6 +4190,162 @@ function wireActionButtons() {
 
 document.addEventListener('DOMContentLoaded', loadDashboard);
 </script>
+
+<!-- ══════════════ MOBILE BOTTOM NAV ══════════════ -->
+<div class="mob-sidebar-backdrop" id="mob-backdrop" onclick="closeMobSidebar()"></div>
+
+<nav class="mob-nav" id="mob-nav" aria-label="Mobile navigation">
+  <div class="mob-nav-inner">
+    <button class="mob-nav-item active" id="mob-btn-dashboard" onclick="mobTab('dashboard',this)" aria-label="Dashboard">
+      <div class="mob-nav-ico">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/>
+          <rect x="14" y="14" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/>
+        </svg>
+      </div>
+      <span class="mob-nav-label">Home</span>
+    </button>
+    <button class="mob-nav-item" id="mob-btn-schools" onclick="mobTab('schools',this)" aria-label="Schools">
+      <div class="mob-nav-ico">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/>
+          <polyline points="9 22 9 12 15 12 15 22"/>
+        </svg>
+      </div>
+      <span class="mob-nav-label">Schools</span>
+    </button>
+    <button class="mob-nav-item" id="mob-btn-submissions" onclick="mobTab('submissions',this)" aria-label="Submissions">
+      <div class="mob-nav-ico" style="position:relative">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/>
+          <circle cx="9" cy="7" r="4"/>
+          <path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/>
+        </svg>
+        <span class="mob-nav-badge" id="mob-sub-badge"></span>
+      </div>
+      <span class="mob-nav-label">Students</span>
+    </button>
+    <button class="mob-nav-item" id="mob-btn-analytics" onclick="mobTab('analytics',this)" aria-label="Analytics">
+      <div class="mob-nav-ico">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <line x1="18" y1="20" x2="18" y2="10"/><line x1="12" y1="20" x2="12" y2="4"/><line x1="6" y1="20" x2="6" y2="14"/>
+        </svg>
+      </div>
+      <span class="mob-nav-label">Analytics</span>
+    </button>
+    <button class="mob-nav-item" id="mob-btn-more" onclick="toggleMobSidebar()" aria-label="More">
+      <div class="mob-nav-ico">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="18" x2="21" y2="18"/>
+        </svg>
+      </div>
+      <span class="mob-nav-label">More</span>
+    </button>
+  </div>
+</nav>
+
+<button class="mob-nav-fab" id="mob-fab" onclick="mobFabAction()" aria-label="Quick action" title="Add">
+  <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+    <line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/>
+  </svg>
+</button>
+
+<script>
+(function(){
+  function mobTab(name, btn) {
+    document.querySelectorAll('.mob-nav-item').forEach(b => b.classList.remove('active'));
+    if (btn) btn.classList.add('active');
+    if (typeof tab === 'function') tab(name, null);
+    const main = document.querySelector('.main');
+    if (main) main.scrollTo({ top: 0, behavior: 'smooth' });
+  }
+  window.mobTab = mobTab;
+
+  function toggleMobSidebar() {
+    const sb = document.getElementById('sidebar');
+    const bd = document.getElementById('mob-backdrop');
+    const open = sb && sb.classList.toggle('open');
+    if (bd) bd.classList.toggle('on', !!open);
+    document.body.style.overflow = open ? 'hidden' : '';
+  }
+  function closeMobSidebar() {
+    const sb = document.getElementById('sidebar');
+    const bd = document.getElementById('mob-backdrop');
+    if (sb) sb.classList.remove('open');
+    if (bd) bd.classList.remove('on');
+    document.body.style.overflow = '';
+  }
+  window.toggleMobSidebar = toggleMobSidebar;
+  window.closeMobSidebar = closeMobSidebar;
+
+  // Sync mob nav with tab() calls
+  const _origTab = window.tab;
+  if (typeof _origTab === 'function') {
+    window.tab = function(name, el) {
+      const r = _origTab.apply(this, arguments);
+      const map = { dashboard:'mob-btn-dashboard', schools:'mob-btn-schools', submissions:'mob-btn-submissions', analytics:'mob-btn-analytics' };
+      if (map[name]) {
+        document.querySelectorAll('.mob-nav-item').forEach(b => b.classList.remove('active'));
+        const t = document.getElementById(map[name]);
+        if (t) t.classList.add('active');
+      }
+      return r;
+    };
+  }
+
+  window.mobFabAction = function() {
+    const activeTab = document.querySelector('.tab-c.active');
+    const id = activeTab ? activeTab.id : '';
+    if (typeof openSchoolModal === 'function' && (id === 'tab-schools' || id === 'tab-dashboard')) { openSchoolModal(); }
+    else if (typeof openSubModal === 'function' && id === 'tab-submissions') { openSubModal(); }
+    else if (typeof openSchoolModal === 'function') { openSchoolModal(); }
+  };
+
+  function updateMobUI() {
+    const isMob = window.innerWidth <= 768;
+    const pgAdmin = document.getElementById('pg-admin');
+    const adminVisible = pgAdmin && pgAdmin.classList.contains('active');
+    const nav = document.getElementById('mob-nav');
+    const fab = document.getElementById('mob-fab');
+    if (nav) nav.style.display = (isMob && adminVisible) ? 'block' : 'none';
+    if (fab) fab.style.display = (isMob && adminVisible) ? 'flex' : 'none';
+  }
+
+  const pgAdmin = document.getElementById('pg-admin');
+  if (pgAdmin) new MutationObserver(updateMobUI).observe(pgAdmin, { attributes: true, attributeFilter: ['class'] });
+  window.addEventListener('resize', updateMobUI);
+  window.addEventListener('load', updateMobUI);
+  setTimeout(updateMobUI, 400);
+
+  // Submissions badge
+  setInterval(() => {
+    const badge = document.getElementById('mob-sub-badge');
+    if (!badge) return;
+    try {
+      const pending = (window.submissions || []).filter(s => s && s.status === 'pending').length;
+      badge.textContent = pending > 99 ? '99+' : (pending || '');
+      badge.classList.toggle('on', pending > 0);
+    } catch(e) {}
+  }, 3000);
+
+  // Close sidebar on nav-item click
+  document.querySelectorAll('.nav-i').forEach(item => {
+    item.addEventListener('click', () => { if (window.innerWidth <= 768) closeMobSidebar(); });
+  });
+
+  // Patch menu-tog
+  const menuTog = document.querySelector('.menu-tog');
+  if (menuTog) {
+    const origClick = menuTog.onclick;
+    menuTog.onclick = null;
+    menuTog.addEventListener('click', (e) => {
+      e.stopPropagation();
+      toggleMobSidebar();
+    });
+  }
+})();
+</script>
+
 </body>
 </html>
 
@@ -8219,4 +8768,160 @@ window._injectorInit = false;
   window.addEventListener('load', () => { injectUI(); applyTheme(); buildSmartNotifications(); });
 })();
 </script>
+
+<!-- ══════════════ MOBILE BOTTOM NAV ══════════════ -->
+<div class="mob-sidebar-backdrop" id="mob-backdrop" onclick="closeMobSidebar()"></div>
+
+<nav class="mob-nav" id="mob-nav" aria-label="Mobile navigation">
+  <div class="mob-nav-inner">
+    <button class="mob-nav-item active" id="mob-btn-dashboard" onclick="mobTab('dashboard',this)" aria-label="Dashboard">
+      <div class="mob-nav-ico">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/>
+          <rect x="14" y="14" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/>
+        </svg>
+      </div>
+      <span class="mob-nav-label">Home</span>
+    </button>
+    <button class="mob-nav-item" id="mob-btn-schools" onclick="mobTab('schools',this)" aria-label="Schools">
+      <div class="mob-nav-ico">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/>
+          <polyline points="9 22 9 12 15 12 15 22"/>
+        </svg>
+      </div>
+      <span class="mob-nav-label">Schools</span>
+    </button>
+    <button class="mob-nav-item" id="mob-btn-submissions" onclick="mobTab('submissions',this)" aria-label="Submissions">
+      <div class="mob-nav-ico" style="position:relative">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/>
+          <circle cx="9" cy="7" r="4"/>
+          <path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/>
+        </svg>
+        <span class="mob-nav-badge" id="mob-sub-badge"></span>
+      </div>
+      <span class="mob-nav-label">Students</span>
+    </button>
+    <button class="mob-nav-item" id="mob-btn-analytics" onclick="mobTab('analytics',this)" aria-label="Analytics">
+      <div class="mob-nav-ico">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <line x1="18" y1="20" x2="18" y2="10"/><line x1="12" y1="20" x2="12" y2="4"/><line x1="6" y1="20" x2="6" y2="14"/>
+        </svg>
+      </div>
+      <span class="mob-nav-label">Analytics</span>
+    </button>
+    <button class="mob-nav-item" id="mob-btn-more" onclick="toggleMobSidebar()" aria-label="More">
+      <div class="mob-nav-ico">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="18" x2="21" y2="18"/>
+        </svg>
+      </div>
+      <span class="mob-nav-label">More</span>
+    </button>
+  </div>
+</nav>
+
+<button class="mob-nav-fab" id="mob-fab" onclick="mobFabAction()" aria-label="Quick action" title="Add">
+  <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+    <line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/>
+  </svg>
+</button>
+
+<script>
+(function(){
+  function mobTab(name, btn) {
+    document.querySelectorAll('.mob-nav-item').forEach(b => b.classList.remove('active'));
+    if (btn) btn.classList.add('active');
+    if (typeof tab === 'function') tab(name, null);
+    const main = document.querySelector('.main');
+    if (main) main.scrollTo({ top: 0, behavior: 'smooth' });
+  }
+  window.mobTab = mobTab;
+
+  function toggleMobSidebar() {
+    const sb = document.getElementById('sidebar');
+    const bd = document.getElementById('mob-backdrop');
+    const open = sb && sb.classList.toggle('open');
+    if (bd) bd.classList.toggle('on', !!open);
+    document.body.style.overflow = open ? 'hidden' : '';
+  }
+  function closeMobSidebar() {
+    const sb = document.getElementById('sidebar');
+    const bd = document.getElementById('mob-backdrop');
+    if (sb) sb.classList.remove('open');
+    if (bd) bd.classList.remove('on');
+    document.body.style.overflow = '';
+  }
+  window.toggleMobSidebar = toggleMobSidebar;
+  window.closeMobSidebar = closeMobSidebar;
+
+  // Sync mob nav with tab() calls
+  const _origTab = window.tab;
+  if (typeof _origTab === 'function') {
+    window.tab = function(name, el) {
+      const r = _origTab.apply(this, arguments);
+      const map = { dashboard:'mob-btn-dashboard', schools:'mob-btn-schools', submissions:'mob-btn-submissions', analytics:'mob-btn-analytics' };
+      if (map[name]) {
+        document.querySelectorAll('.mob-nav-item').forEach(b => b.classList.remove('active'));
+        const t = document.getElementById(map[name]);
+        if (t) t.classList.add('active');
+      }
+      return r;
+    };
+  }
+
+  window.mobFabAction = function() {
+    const activeTab = document.querySelector('.tab-c.active');
+    const id = activeTab ? activeTab.id : '';
+    if (typeof openSchoolModal === 'function' && (id === 'tab-schools' || id === 'tab-dashboard')) { openSchoolModal(); }
+    else if (typeof openSubModal === 'function' && id === 'tab-submissions') { openSubModal(); }
+    else if (typeof openSchoolModal === 'function') { openSchoolModal(); }
+  };
+
+  function updateMobUI() {
+    const isMob = window.innerWidth <= 768;
+    const pgAdmin = document.getElementById('pg-admin');
+    const adminVisible = pgAdmin && pgAdmin.classList.contains('active');
+    const nav = document.getElementById('mob-nav');
+    const fab = document.getElementById('mob-fab');
+    if (nav) nav.style.display = (isMob && adminVisible) ? 'block' : 'none';
+    if (fab) fab.style.display = (isMob && adminVisible) ? 'flex' : 'none';
+  }
+
+  const pgAdmin = document.getElementById('pg-admin');
+  if (pgAdmin) new MutationObserver(updateMobUI).observe(pgAdmin, { attributes: true, attributeFilter: ['class'] });
+  window.addEventListener('resize', updateMobUI);
+  window.addEventListener('load', updateMobUI);
+  setTimeout(updateMobUI, 400);
+
+  // Submissions badge
+  setInterval(() => {
+    const badge = document.getElementById('mob-sub-badge');
+    if (!badge) return;
+    try {
+      const pending = (window.submissions || []).filter(s => s && s.status === 'pending').length;
+      badge.textContent = pending > 99 ? '99+' : (pending || '');
+      badge.classList.toggle('on', pending > 0);
+    } catch(e) {}
+  }, 3000);
+
+  // Close sidebar on nav-item click
+  document.querySelectorAll('.nav-i').forEach(item => {
+    item.addEventListener('click', () => { if (window.innerWidth <= 768) closeMobSidebar(); });
+  });
+
+  // Patch menu-tog
+  const menuTog = document.querySelector('.menu-tog');
+  if (menuTog) {
+    const origClick = menuTog.onclick;
+    menuTog.onclick = null;
+    menuTog.addEventListener('click', (e) => {
+      e.stopPropagation();
+      toggleMobSidebar();
+    });
+  }
+})();
+</script>
+
 </body>
