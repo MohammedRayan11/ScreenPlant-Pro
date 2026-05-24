@@ -12,9 +12,6 @@ shortcuts, activity log, enhanced notifications, settings appearance controls.
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,300;0,9..40,400;0,9..40,500;0,9..40,600;0,9..40,700;1,9..40,400&family=Fraunces:ital,opsz,wght@0,9..144,400;0,9..144,600;0,9..144,700;0,9..144,800;1,9..144,700&display=swap" rel="stylesheet">
 <style>
-/* ─── Google Fonts ──────────────────────────────────────────────────────── */
-@import url('https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,300;0,9..40,400;0,9..40,500;0,9..40,600;0,9..40,700;1,9..40,400&family=Fraunces:ital,opsz,wght@0,9..144,400;0,9..144,600;0,9..144,700;0,9..144,800;1,9..144,700&display=swap');
-
 /* ─── Reset ─────────────────────────────────────────────────────────────── */
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
 
@@ -4538,8 +4535,6 @@ document.getElementById('l-pass').addEventListener('keydown', e => { if(e.key===
 
 function openForgotPassword() {
   ['fp-otp','fp-new','fp-confirm'].forEach(id => { const el = document.getElementById(id); if (el) el.value = ''; });
-  const phone = document.getElementById('fp-phone');
-  if (phone && !phone.value) phone.value = '8553031925';
   const local = document.getElementById('fp-local-otp');
   if (local) { local.style.display = 'none'; local.textContent = ''; }
   const status = document.getElementById('fp-status');
@@ -8926,3 +8921,4 @@ window._injectorInit = false;
 
 </body>
 
+</html>
