@@ -262,13 +262,16 @@ template_cache = {}
 generation_jobs = {}
 generation_jobs_lock = threading.RLock()
 generation_executor = ThreadPoolExecutor(
-    max_workers=max(1, int(os.environ.get('SCREENPLANT_GENERATION_WORKERS', '1'))),
+    max_workers=max(2, int(os.environ.get('SCREENPLANT_GENERATION_WORKERS', '4'))),
     thread_name_prefix='screenplant-gen'
 )
 rate_bucket = {}
 login_failures = {}   # ip -> {'count': int, 'locked_until': float}
 reset_otps = {}       # phone -> {'hash': str, 'expires': float, 'attempts': int}
 admin_password_hash_override = ''
+
+# Stats cache — avoids running 8+ DB queries on every dashboard refresh
+_stats_cache = {'data': None, 'expires': 0.0}
 
 # [ENHANCED] Runtime password hashing for the change-password endpoint. Existing
 # env-based plaintext auth remains supported for backward compatibility.
@@ -349,11 +352,66 @@ def sqlite_conn():
     conn = sqlite3.connect(SQLITE_FILE, timeout=30)
     conn.execute('PRAGMA journal_mode=WAL')
     conn.execute('PRAGMA busy_timeout=30000')
+    conn.execute('PRAGMA synchronous=NORMAL')
+    conn.execute('PRAGMA cache_size=10000')
     return conn
 
+# ── PostgreSQL connection pool ────────────────────────────────────────────────
+_pg_pool = None
+_pg_pool_lock = threading.Lock()
+
+def _get_pg_pool():
+    global _pg_pool
+    if _pg_pool is not None:
+        return _pg_pool
+    with _pg_pool_lock:
+        if _pg_pool is not None:
+            return _pg_pool
+        try:
+            from psycopg_pool import ConnectionPool
+            psycopg, tuple_row, _ = pg_driver()
+            min_size = int(os.environ.get('SCREENPLANT_PG_POOL_MIN', '2'))
+            max_size = int(os.environ.get('SCREENPLANT_PG_POOL_MAX', '10'))
+            _pg_pool = ConnectionPool(
+                DATABASE_URL,
+                min_size=min_size,
+                max_size=max_size,
+                kwargs={'row_factory': tuple_row, 'connect_timeout': 5},
+                open=True,
+            )
+            logger.info("PostgreSQL connection pool started (min=%d max=%d)", min_size, max_size)
+        except ImportError:
+            logger.warning(
+                "psycopg_pool not installed — falling back to per-request connections. "
+                "Run `pip install psycopg-pool` for much better performance."
+            )
+            _pg_pool = None
+    return _pg_pool
+
 def pg_conn():
+    """Return a PostgreSQL connection. Uses pool when psycopg_pool is available."""
+    pool = _get_pg_pool()
+    if pool is not None:
+        return pool.getconn()
     psycopg, tuple_row, _ = pg_driver()
-    return psycopg.connect(DATABASE_URL, row_factory=tuple_row, connect_timeout=3)
+    return psycopg.connect(DATABASE_URL, row_factory=tuple_row, connect_timeout=5)
+
+def _release_pg_conn(conn):
+    """Return a connection to the pool, or close it if pooling is unavailable."""
+    pool = _get_pg_pool()
+    if pool is not None:
+        try:
+            pool.putconn(conn)
+        except Exception:
+            try:
+                conn.close()
+            except Exception:
+                pass
+    else:
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 def load_sqlite_state():
     if not os.path.exists(SQLITE_FILE):
@@ -966,6 +1024,352 @@ def db_list_orders():
             return [json.loads(row[0]) for row in conn.execute('SELECT data FROM screenplant_orders ORDER BY order_date, id').fetchall()]
     with closing(pg_conn()) as conn:
         return [row[0] for row in conn.execute('SELECT data FROM screenplant_orders ORDER BY order_date, id').fetchall()]
+
+# ── Surgical school helpers ────────────────────────────────────────────────────
+
+def db_insert_school(school):
+    init_db()
+    now = datetime.now().isoformat()
+    if not use_postgres():
+        with closing(sqlite_conn()) as conn:
+            conn.execute(
+                'INSERT INTO screenplant_schools (id, name, school_type, created_at, updated_at, data) VALUES (?, ?, ?, ?, ?, ?)',
+                (school.get('id'), school.get('name', ''), school.get('type', ''), school.get('created_at', ''), now, json.dumps(school, default=str))
+            )
+            conn.commit()
+        return
+    _, _, Jsonb = pg_driver()
+    with closing(pg_conn()) as conn:
+        conn.execute(
+            'INSERT INTO screenplant_schools (id, name, school_type, created_at, updated_at, data) VALUES (%s, %s, %s, %s, NOW()::TEXT, %s)',
+            (school.get('id'), school.get('name', ''), school.get('type', ''), school.get('created_at', ''), Jsonb(school))
+        )
+        conn.commit()
+
+def db_update_school(school):
+    init_db()
+    now = datetime.now().isoformat()
+    if not use_postgres():
+        with closing(sqlite_conn()) as conn:
+            conn.execute(
+                'UPDATE screenplant_schools SET name=?, school_type=?, updated_at=?, data=? WHERE id=?',
+                (school.get('name', ''), school.get('type', ''), now, json.dumps(school, default=str), school.get('id'))
+            )
+            conn.commit()
+        return
+    _, _, Jsonb = pg_driver()
+    with closing(pg_conn()) as conn:
+        conn.execute(
+            'UPDATE screenplant_schools SET name=%s, school_type=%s, updated_at=NOW()::TEXT, data=%s WHERE id=%s',
+            (school.get('name', ''), school.get('type', ''), Jsonb(school), school.get('id'))
+        )
+        conn.commit()
+
+def db_delete_school(school_id):
+    init_db()
+    if not use_postgres():
+        with closing(sqlite_conn()) as conn:
+            conn.execute('DELETE FROM screenplant_schools WHERE id = ?', (school_id,))
+            conn.commit()
+        return
+    with closing(pg_conn()) as conn:
+        conn.execute('DELETE FROM screenplant_schools WHERE id = %s', (school_id,))
+        conn.commit()
+
+def db_delete_submissions_by_school(school_id):
+    """Return deleted submission records and remove them from DB atomically."""
+    init_db()
+    if not use_postgres():
+        with closing(sqlite_conn()) as conn:
+            rows = conn.execute('SELECT data FROM screenplant_submissions WHERE school_id = ?', (school_id,)).fetchall()
+            deleted = [json.loads(r[0]) for r in rows]
+            conn.execute('DELETE FROM screenplant_submissions WHERE school_id = ?', (school_id,))
+            conn.commit()
+        return deleted
+    with closing(pg_conn()) as conn:
+        rows = conn.execute('SELECT data FROM screenplant_submissions WHERE school_id = %s', (school_id,)).fetchall()
+        deleted = [r[0] for r in rows]
+        conn.execute('DELETE FROM screenplant_submissions WHERE school_id = %s', (school_id,))
+        conn.commit()
+    return deleted
+
+def db_delete_submission_by_id(sub_id):
+    """Return the deleted submission record and remove it from DB."""
+    init_db()
+    if not use_postgres():
+        with closing(sqlite_conn()) as conn:
+            row = conn.execute('SELECT data FROM screenplant_submissions WHERE id = ?', (sub_id,)).fetchone()
+            sub = json.loads(row[0]) if row else None
+            conn.execute('DELETE FROM screenplant_submissions WHERE id = ?', (sub_id,))
+            conn.commit()
+        return sub
+    with closing(pg_conn()) as conn:
+        row = conn.execute('SELECT data FROM screenplant_submissions WHERE id = %s', (sub_id,)).fetchone()
+        sub = row[0] if row else None
+        conn.execute('DELETE FROM screenplant_submissions WHERE id = %s', (sub_id,))
+        conn.commit()
+    return sub
+
+def db_delete_all_submissions():
+    """Return all submissions as deleted records and clear the table."""
+    init_db()
+    if not use_postgres():
+        with closing(sqlite_conn()) as conn:
+            rows = conn.execute('SELECT data FROM screenplant_submissions').fetchall()
+            deleted = [json.loads(r[0]) for r in rows]
+            conn.execute('DELETE FROM screenplant_submissions')
+            conn.commit()
+        return deleted
+    with closing(pg_conn()) as conn:
+        rows = conn.execute('SELECT data FROM screenplant_submissions').fetchall()
+        deleted = [r[0] for r in rows]
+        conn.execute('DELETE FROM screenplant_submissions')
+        conn.commit()
+    return deleted
+
+# ── Surgical template helpers ──────────────────────────────────────────────────
+
+def db_insert_template(tpl):
+    init_db()
+    now = datetime.now().isoformat()
+    if not use_postgres():
+        with closing(sqlite_conn()) as conn:
+            conn.execute(
+                'INSERT INTO screenplant_templates (id, school_id, name, file_path, created_at, updated_at, data) VALUES (?, ?, ?, ?, ?, ?, ?)',
+                (tpl.get('id'), tpl.get('school_id', ''), tpl.get('name', ''), tpl.get('file', ''), tpl.get('created_at', ''), now, json.dumps(tpl, default=str))
+            )
+            conn.commit()
+        return
+    _, _, Jsonb = pg_driver()
+    with closing(pg_conn()) as conn:
+        conn.execute(
+            'INSERT INTO screenplant_templates (id, school_id, name, file_path, created_at, updated_at, data) VALUES (%s, %s, %s, %s, %s, NOW()::TEXT, %s)',
+            (tpl.get('id'), tpl.get('school_id', ''), tpl.get('name', ''), tpl.get('file', ''), tpl.get('created_at', ''), Jsonb(tpl))
+        )
+        conn.commit()
+
+def db_update_template(tpl):
+    init_db()
+    now = datetime.now().isoformat()
+    if not use_postgres():
+        with closing(sqlite_conn()) as conn:
+            conn.execute(
+                'UPDATE screenplant_templates SET name=?, school_id=?, file_path=?, updated_at=?, data=? WHERE id=?',
+                (tpl.get('name', ''), tpl.get('school_id', ''), tpl.get('file', ''), now, json.dumps(tpl, default=str), tpl.get('id'))
+            )
+            conn.commit()
+        return
+    _, _, Jsonb = pg_driver()
+    with closing(pg_conn()) as conn:
+        conn.execute(
+            'UPDATE screenplant_templates SET name=%s, school_id=%s, file_path=%s, updated_at=NOW()::TEXT, data=%s WHERE id=%s',
+            (tpl.get('name', ''), tpl.get('school_id', ''), tpl.get('file', ''), Jsonb(tpl), tpl.get('id'))
+        )
+        conn.commit()
+
+def db_delete_template(tpl_id):
+    init_db()
+    if not use_postgres():
+        with closing(sqlite_conn()) as conn:
+            conn.execute('DELETE FROM screenplant_templates WHERE id = ?', (tpl_id,))
+            conn.commit()
+        return
+    with closing(pg_conn()) as conn:
+        conn.execute('DELETE FROM screenplant_templates WHERE id = %s', (tpl_id,))
+        conn.commit()
+
+def db_get_template(tpl_id):
+    init_db()
+    if not use_postgres():
+        with closing(sqlite_conn()) as conn:
+            row = conn.execute('SELECT data FROM screenplant_templates WHERE id = ?', (tpl_id,)).fetchone()
+            return json.loads(row[0]) if row else None
+    with closing(pg_conn()) as conn:
+        row = conn.execute('SELECT data FROM screenplant_templates WHERE id = %s', (tpl_id,)).fetchone()
+        return row[0] if row else None
+
+# ── Surgical order helpers ─────────────────────────────────────────────────────
+
+def db_insert_order(order):
+    init_db()
+    now = datetime.now().isoformat()
+    total = order.get('total')
+    try:
+        total = float(total) if total not in (None, '') else None
+    except (TypeError, ValueError):
+        total = None
+    if not use_postgres():
+        with closing(sqlite_conn()) as conn:
+            conn.execute(
+                'INSERT INTO screenplant_orders (id, school_id, status, order_date, total, updated_at, data) VALUES (?, ?, ?, ?, ?, ?, ?)',
+                (order.get('id'), order.get('school_id', ''), order.get('status', ''), order.get('date', now), total, now, json.dumps(order, default=str))
+            )
+            conn.commit()
+        return
+    _, _, Jsonb = pg_driver()
+    with closing(pg_conn()) as conn:
+        conn.execute(
+            'INSERT INTO screenplant_orders (id, school_id, status, order_date, total, updated_at, data) VALUES (%s, %s, %s, %s, %s, NOW()::TEXT, %s)',
+            (order.get('id'), order.get('school_id', ''), order.get('status', ''), order.get('date', now), total, Jsonb(order))
+        )
+        conn.commit()
+
+def db_update_order(order):
+    init_db()
+    now = datetime.now().isoformat()
+    total = order.get('total')
+    try:
+        total = float(total) if total not in (None, '') else None
+    except (TypeError, ValueError):
+        total = None
+    if not use_postgres():
+        with closing(sqlite_conn()) as conn:
+            conn.execute(
+                'UPDATE screenplant_orders SET status=?, total=?, updated_at=?, data=? WHERE id=?',
+                (order.get('status', ''), total, now, json.dumps(order, default=str), order.get('id'))
+            )
+            conn.commit()
+        return
+    _, _, Jsonb = pg_driver()
+    with closing(pg_conn()) as conn:
+        conn.execute(
+            'UPDATE screenplant_orders SET status=%s, total=%s, updated_at=NOW()::TEXT, data=%s WHERE id=%s',
+            (order.get('status', ''), total, Jsonb(order), order.get('id'))
+        )
+        conn.commit()
+
+def db_delete_order(order_id):
+    init_db()
+    if not use_postgres():
+        with closing(sqlite_conn()) as conn:
+            conn.execute('DELETE FROM screenplant_orders WHERE id = ?', (order_id,))
+            conn.commit()
+        return
+    with closing(pg_conn()) as conn:
+        conn.execute('DELETE FROM screenplant_orders WHERE id = %s', (order_id,))
+        conn.commit()
+
+def db_get_order(order_id):
+    init_db()
+    if not use_postgres():
+        with closing(sqlite_conn()) as conn:
+            row = conn.execute('SELECT data FROM screenplant_orders WHERE id = ?', (order_id,)).fetchone()
+            return json.loads(row[0]) if row else None
+    with closing(pg_conn()) as conn:
+        row = conn.execute('SELECT data FROM screenplant_orders WHERE id = %s', (order_id,)).fetchone()
+        return row[0] if row else None
+
+# ── Surgical settings helpers ──────────────────────────────────────────────────
+
+def db_update_settings(settings_dict):
+    init_db()
+    now = datetime.now().isoformat()
+    if not use_postgres():
+        with closing(sqlite_conn()) as conn:
+            conn.execute(
+                'INSERT INTO screenplant_settings (id, updated_at, data) VALUES (1, ?, ?) ON CONFLICT(id) DO UPDATE SET updated_at=excluded.updated_at, data=excluded.data',
+                (now, json.dumps(settings_dict, default=str))
+            )
+            conn.commit()
+        return
+    _, _, Jsonb = pg_driver()
+    with closing(pg_conn()) as conn:
+        conn.execute(
+            'INSERT INTO screenplant_settings (id, updated_at, data) VALUES (1, NOW()::TEXT, %s) ON CONFLICT(id) DO UPDATE SET updated_at=NOW()::TEXT, data=EXCLUDED.data',
+            (Jsonb(settings_dict),)
+        )
+        conn.commit()
+
+# ── Surgical deleted_items helpers ────────────────────────────────────────────
+
+def db_insert_deleted_item(item):
+    init_db()
+    now = datetime.now().isoformat()
+    if not use_postgres():
+        with closing(sqlite_conn()) as conn:
+            conn.execute(
+                'INSERT INTO screenplant_deleted_items (id, item_type, item_id, deleted_at, updated_at, data) VALUES (?, ?, ?, ?, ?, ?)',
+                (item.get('id'), item.get('type', ''), item.get('item_id', ''), item.get('deleted_at', ''), now, json.dumps(item, default=str))
+            )
+            conn.commit()
+        return
+    _, _, Jsonb = pg_driver()
+    with closing(pg_conn()) as conn:
+        conn.execute(
+            'INSERT INTO screenplant_deleted_items (id, item_type, item_id, deleted_at, updated_at, data) VALUES (%s, %s, %s, %s, NOW()::TEXT, %s)',
+            (item.get('id'), item.get('type', ''), item.get('item_id', ''), item.get('deleted_at', ''), Jsonb(item))
+        )
+        conn.commit()
+
+def db_update_deleted_item(item):
+    """Update a deleted_item record in-place (e.g. after purging photos)."""
+    init_db()
+    now = datetime.now().isoformat()
+    if not use_postgres():
+        with closing(sqlite_conn()) as conn:
+            conn.execute(
+                'UPDATE screenplant_deleted_items SET updated_at=?, data=? WHERE id=?',
+                (now, json.dumps(item, default=str), item.get('id'))
+            )
+            conn.commit()
+        return
+    _, _, Jsonb = pg_driver()
+    with closing(pg_conn()) as conn:
+        conn.execute(
+            'UPDATE screenplant_deleted_items SET updated_at=NOW()::TEXT, data=%s WHERE id=%s',
+            (Jsonb(item), item.get('id'))
+        )
+        conn.commit()
+
+def db_get_deleted_item(deleted_id):
+    init_db()
+    if not use_postgres():
+        with closing(sqlite_conn()) as conn:
+            row = conn.execute('SELECT data FROM screenplant_deleted_items WHERE id = ?', (deleted_id,)).fetchone()
+            return json.loads(row[0]) if row else None
+    with closing(pg_conn()) as conn:
+        row = conn.execute('SELECT data FROM screenplant_deleted_items WHERE id = %s', (deleted_id,)).fetchone()
+        return row[0] if row else None
+
+def db_insert_deleted_item_and_submission(sub):
+    """Atomically record a deletion + remove the submission row (SQLite only; PG uses same approach)."""
+    rec = deleted_record('submission', sub)
+    db_insert_deleted_item(rec)
+    db_delete_submission_by_id(sub.get('id'))
+    return rec
+
+def db_list_deleted_items():
+    init_db()
+    if not use_postgres():
+        with closing(sqlite_conn()) as conn:
+            return [json.loads(r[0]) for r in conn.execute('SELECT data FROM screenplant_deleted_items ORDER BY deleted_at DESC, id DESC').fetchall()]
+    with closing(pg_conn()) as conn:
+        return [r[0] for r in conn.execute('SELECT data FROM screenplant_deleted_items ORDER BY deleted_at DESC, id DESC').fetchall()]
+
+def db_restore_submission_from_deleted(item):
+    """Move a submission from deleted_items back into submissions."""
+    data = item.get('data') or {}
+    db_insert_submission(data)
+    item['restored'] = True
+    item['restored_at'] = datetime.now().isoformat()
+    db_update_deleted_item(item)
+    return data
+
+def db_restore_school_from_deleted(item):
+    data = item.get('data') or {}
+    db_insert_school(data)
+    item['restored'] = True
+    item['restored_at'] = datetime.now().isoformat()
+    db_update_deleted_item(item)
+    return data
+
+def db_restore_order_from_deleted(item):
+    data = item.get('data') or {}
+    db_insert_order(data)
+    item['restored'] = True
+    item['restored_at'] = datetime.now().isoformat()
+    db_update_deleted_item(item)
+    return data
 
 def db_insert_submission(sub):
     init_db()
@@ -2092,9 +2496,9 @@ def auth_reset_password():
     if not otp or not hmac.compare_digest(record.get('hash', ''), otp_hash(phone, otp)):
         return jsonify({"error": "Invalid OTP"}), 400
     new_hash = password_hash(new_password)
-    db = load_db()
-    db.setdefault('settings', {})['admin_password_hash'] = new_hash
-    save_db(db)
+    settings = db_get_settings()
+    settings['admin_password_hash'] = new_hash
+    db_update_settings(settings)
     global admin_password_hash_override
     admin_password_hash_override = new_hash
     reset_otps.pop(phone, None)
@@ -2115,9 +2519,9 @@ def auth_change_password():
     if len(new_password) < 8:
         return jsonify({"error": "New password must be at least 8 characters"}), 400
     new_hash = password_hash(new_password)
-    db = load_db()
-    db.setdefault('settings', {})['admin_password_hash'] = new_hash
-    save_db(db)
+    settings = db_get_settings()
+    settings['admin_password_hash'] = new_hash
+    db_update_settings(settings)
     admin_password_hash_override = new_hash
     login_failures.clear()
     audit('auth.password_changed')
@@ -2264,16 +2668,31 @@ def get_schools():
 @admin_required
 def get_school_health(school_id):
     # [NEW] School completion and health score endpoint.
-    db = load_db()
-    school = next((s for s in db.get('schools', []) if s.get('id') == school_id), None)
+    school = db_get_school(school_id)
     if not school:
         return jsonify({"error": "School not found"}), 404
-    return jsonify(school_health_payload(db, school))
+    stats = db_school_submission_stats(school_id)
+    total = stats['students']
+    with_photo = stats['with_photo']
+    pct = round((with_photo / total) * 100, 1) if total else 0
+    payload = {
+        "school_id": school_id,
+        "id": school_id,
+        "name": school.get('name', ''),
+        "total": total,
+        "with_photo": with_photo,
+        "completion_pct": pct,
+        "health": health_label(pct),
+        "last_submission": '',
+        "pending": stats['pending'],
+        "generated": stats['generated'],
+        "printed": stats['printed'],
+    }
+    return jsonify(payload)
 
 @app.route('/api/schools', methods=['POST'])
 @admin_required
 def add_school():
-    db = load_db()
     data = request.json or {}
     school = {
         "id": gen_id("sch_"),
@@ -2290,16 +2709,14 @@ def add_school():
     }
     if not school["name"]:
         return jsonify({"error": "School name is required"}), 400
-    db["schools"].append(school)
-    save_db(db)
+    db_insert_school(school)
     audit('school.create', school['id'])
     return jsonify(school), 201
 
 @app.route('/api/schools/<school_id>', methods=['PUT'])
 @admin_required
 def update_school(school_id):
-    db = load_db()
-    school = next((s for s in db['schools'] if s['id'] == school_id), None)
+    school = db_get_school(school_id)
     if not school:
         return jsonify({"error": "School not found"}), 404
     data = request.json or {}
@@ -2308,41 +2725,31 @@ def update_school(school_id):
             school[k] = clean_text(data[k], 500 if k == 'notes' else 300)
     if 'classes' in data:
         school['classes'] = sanitize_classes(data['classes'])
-    save_db(db)
+    db_update_school(school)
     return jsonify(school)
 
 @app.route('/api/schools/<school_id>', methods=['DELETE'])
 @admin_required
 def delete_school(school_id):
-    db = load_db()
-    school = next((s for s in db['schools'] if s['id'] == school_id), None)
+    school = db_get_school(school_id)
     if school:
-        db.setdefault('deleted_items', []).append(deleted_record('school', school))
-    deleted_subs = [s for s in db['submissions'] if s.get('school_id') == school_id]
+        db_insert_deleted_item(deleted_record('school', school))
+    deleted_subs = db_delete_submissions_by_school(school_id)
     for sub in deleted_subs:
-        db.setdefault('deleted_items', []).append(deleted_record('submission', sub))
-    # Keep photo/signature files for 7 days after delete. Auto-trash cleanup
-    # removes only files later; DB trash records stay permanently for audit.
-    db['schools'] = [s for s in db['schools'] if s['id'] != school_id]
-    db['submissions'] = [s for s in db['submissions'] if s.get('school_id') != school_id]
-    save_db(db)
+        db_insert_deleted_item(deleted_record('submission', sub))
+    db_delete_school(school_id)
     audit('school.delete', f"id={school_id} cascade_subs={len(deleted_subs)}")
     return jsonify({"ok": True})
 
 @app.route('/api/schools/<school_id>/submissions', methods=['DELETE'])
 @admin_required
 def delete_school_submissions(school_id):
-    db = load_db()
-    school = next((s for s in db.get('schools', []) if s.get('id') == school_id), None)
+    school = db_get_school(school_id)
     if not school:
         return jsonify({"error": "School not found"}), 404
-    deleted_subs = [s for s in db.get('submissions', []) if s.get('school_id') == school_id]
+    deleted_subs = db_delete_submissions_by_school(school_id)
     for sub in deleted_subs:
-        db.setdefault('deleted_items', []).append(deleted_record('submission', sub))
-    # Keep photo/signature files for 7 days after delete. Auto-trash cleanup
-    # removes only files later; DB trash records stay permanently for audit.
-    db['submissions'] = [s for s in db.get('submissions', []) if s.get('school_id') != school_id]
-    save_db(db)
+        db_insert_deleted_item(deleted_record('submission', sub))
     audit('submission.bulk_delete_school', f"school_id={school_id} count={len(deleted_subs)}")
     return jsonify({"ok": True, "deleted": len(deleted_subs), "school_id": school_id})
 
@@ -2363,7 +2770,6 @@ def upload_template():
       - school_id, name, card_w_mm, card_h_mm,
         fields JSON: {name:{x,y,size,color}, rollno:{...}, ...}
     """
-    db = load_db()
     school_id  = request.form.get('school_id', '')
     tpl_name   = clean_text(request.form.get('name', 'Template'), 140)
     card_w_mm  = parse_float(request.form.get('card_w_mm', 85.6), 85.6, 20, 300)
@@ -2401,43 +2807,37 @@ def upload_template():
         "fields": fields,        # field layout positions
         "created_at": datetime.now().isoformat()
     }
-    db.setdefault('templates', []).append(template)
-    save_db(db)
+    db_insert_template(template)
     return jsonify(template), 201
 
 @app.route('/api/templates/<tpl_id>', methods=['DELETE'])
 @admin_required
 def delete_template(tpl_id):
-    db = load_db()
-    tpl = next((t for t in db.get('templates',[]) if t['id'] == tpl_id), None)
+    tpl = db_get_template(tpl_id)
     if tpl and tpl.get('file') and os.path.exists(tpl['file']):
         os.remove(tpl['file'])
-    db['templates'] = [t for t in db.get('templates',[]) if t['id'] != tpl_id]
-    save_db(db)
+    db_delete_template(tpl_id)
     return jsonify({"ok": True})
 
 @app.route('/api/templates/<tpl_id>/duplicate', methods=['POST'])
 @admin_required
 def duplicate_template(tpl_id):
     # [NEW] Clone a template config while reusing the same stored asset.
-    db = load_db()
-    tpl = next((t for t in db.get('templates', []) if t.get('id') == tpl_id), None)
+    tpl = db_get_template(tpl_id)
     if not tpl:
         return jsonify({"error": "Template not found"}), 404
     clone = json.loads(json.dumps(tpl, default=str))
     clone['id'] = gen_id('tpl_')
     clone['name'] = 'Copy of ' + clean_text(tpl.get('name', 'Template'), 120)
     clone['created_at'] = datetime.now().isoformat()
-    db.setdefault('templates', []).append(clone)
-    save_db(db)
+    db_insert_template(clone)
     audit('template.duplicate', f"id={tpl_id} clone={clone['id']}")
     return jsonify(clone), 201
 
 @app.route('/api/templates/<tpl_id>', methods=['PUT'])
 @admin_required
 def update_template(tpl_id):
-    db = load_db()
-    tpl = next((t for t in db.get('templates', []) if t['id'] == tpl_id), None)
+    tpl = db_get_template(tpl_id)
     if not tpl:
         return jsonify({"error": "Template not found"}), 404
     # Update via multipart form (same shape as upload)
@@ -2468,7 +2868,7 @@ def update_template(tpl_id):
         file_path = os.path.join(TEMPLATES_DIR, fname)
         file.save(file_path)
         tpl['file'] = file_path
-    save_db(db)
+    db_update_template(tpl)
     return jsonify(tpl)
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2485,13 +2885,12 @@ def get_form_schema(school_id):
 @app.route('/api/form-schema/<school_id>', methods=['PUT'])
 @admin_required
 def save_form_schema(school_id):
-    db = load_db()
-    school = next((s for s in db['schools'] if s['id'] == school_id), None)
+    school = db_get_school(school_id)
     if not school:
         return jsonify({"error": "Not found"}), 404
     data = request.json or {}
     school['form_schema'] = sanitize_form_schema(data.get('fields', []))
-    save_db(db)
+    db_update_school(school)
     return jsonify({"fields": school['form_schema']})
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2501,12 +2900,9 @@ def save_form_schema(school_id):
 @admin_required
 def get_submissions():
     if request.method == 'DELETE':
-        db = load_db()
-        deleted_subs = list(db.get('submissions', []))
+        deleted_subs = db_delete_all_submissions()
         for sub in deleted_subs:
-            db.setdefault('deleted_items', []).append(deleted_record('submission', sub))
-        db['submissions'] = []
-        save_db(db)
+            db_insert_deleted_item(deleted_record('submission', sub))
         audit('submission.bulk_delete_all', f"count={len(deleted_subs)}")
         return jsonify({"ok": True, "deleted": len(deleted_subs)})
 
@@ -2850,14 +3246,10 @@ def patch_submission(sub_id):
 @app.route('/api/submissions/<sub_id>', methods=['DELETE'])
 @admin_required
 def delete_submission(sub_id):
-    db = load_db()
-    sub = next((s for s in db['submissions'] if s['id'] == sub_id), None)
+    sub = db_get_submission(sub_id)
     if sub:
-        db.setdefault('deleted_items', []).append(deleted_record('submission', sub))
-        # Keep photo/signature files for 7 days after delete. Auto-trash cleanup
-        # removes only files later; DB trash records stay permanently for audit.
-    db['submissions'] = [s for s in db['submissions'] if s['id'] != sub_id]
-    save_db(db)
+        db_insert_deleted_item(deleted_record('submission', sub))
+    db_delete_submission_by_id(sub_id)
     audit('submission.delete', f"id={sub_id}")
     return jsonify({"ok": True})
 
@@ -2896,37 +3288,32 @@ def update_photo_status(sub_id):
 @app.route('/api/deleted', methods=['GET'])
 @admin_required
 def get_deleted_items():
-    db = load_db()
     item_type = request.args.get('type', '')
-    items = db.get('deleted_items', [])
+    items = db_list_deleted_items()
     if item_type:
         items = [x for x in items if x.get('type') == item_type]
-    return jsonify(sorted(items, key=lambda x: x.get('deleted_at', ''), reverse=True))
+    return jsonify(items)
 
 @app.route('/api/deleted/<deleted_id>/restore', methods=['POST'])
 @admin_required
 def restore_deleted_item(deleted_id):
-    db = load_db()
-    item = next((x for x in db.get('deleted_items', []) if x.get('id') == deleted_id), None)
+    item = db_get_deleted_item(deleted_id)
     if not item:
         return jsonify({"error": "Deleted item not found"}), 404
     item_type = item.get('type')
     data = item.get('data') or {}
     if item_type == 'submission':
-        if any(s.get('id') == data.get('id') for s in db.get('submissions', [])):
+        if db_get_submission(data.get('id')):
             return jsonify({"error": "Submission already exists"}), 409
-        db.setdefault('submissions', []).append(data)
+        data = db_restore_submission_from_deleted(item)
     elif item_type == 'school':
-        if any(s.get('id') == data.get('id') for s in db.get('schools', [])):
+        if db_get_school(data.get('id')):
             return jsonify({"error": "School already exists"}), 409
-        db.setdefault('schools', []).append(data)
+        data = db_restore_school_from_deleted(item)
     elif item_type == 'order':
-        db.setdefault('orders', []).append(data)
+        data = db_restore_order_from_deleted(item)
     else:
         return jsonify({"error": "This item type cannot be restored"}), 400
-    item['restored'] = True
-    item['restored_at'] = datetime.now().isoformat()
-    save_db(db)
     return jsonify({"ok": True, "restored": data})
 
 def purge_deleted_item_files(item):
@@ -2952,12 +3339,11 @@ def purge_deleted_item_files(item):
 @app.route('/api/deleted/<deleted_id>', methods=['DELETE'])
 @admin_required
 def purge_deleted_item(deleted_id):
-    db = load_db()
-    item = next((x for x in db.get('deleted_items', []) if x.get('id') == deleted_id), None)
+    item = db_get_deleted_item(deleted_id)
     if not item:
         return jsonify({"error": "Deleted item not found"}), 404
     item['purge_requested_at'] = purge_deleted_item_files(item)
-    save_db(db)
+    db_update_deleted_item(item)
     return jsonify({"ok": True, "photos_purged": True, "kept_deleted_record": True})
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -3678,9 +4064,8 @@ def get_orders():
 @app.route('/api/orders', methods=['POST'])
 @admin_required
 def add_order():
-    db = load_db()
     data = request.json or {}
-    school = next((s for s in db['schools'] if s['id'] == data.get('school_id')), {})
+    school = db_get_school(clean_text(data.get('school_id', ''), 60)) or {}
     qty = parse_int(data.get('qty'), 0, 0, 1000000)
     price_per = parse_float(data.get('price_per'), 25, 0, 100000)
     order = {
@@ -3694,41 +4079,42 @@ def add_order():
         "notes":        clean_text(data.get('notes',''), 1000),
         "date":         datetime.now().isoformat()
     }
-    db.setdefault('orders',[]).append(order)
-    save_db(db)
+    db_insert_order(order)
     return jsonify(order), 201
 
 @app.route('/api/orders/<order_id>', methods=['PATCH'])
 @admin_required
 def update_order(order_id):
-    db = load_db()
-    order = next((o for o in db.get('orders',[]) if o['id'] == order_id), None)
+    order = db_get_order(order_id)
     if not order:
         return jsonify({"error": "Not found"}), 404
     data = request.json or {}
     for k in ['status','notes']:
         if k in data:
             order[k] = clean_text(data[k], 1000 if k == 'notes' else 40)
-    save_db(db)
+    db_update_order(order)
     return jsonify(order)
 
 @app.route('/api/orders/<order_id>', methods=['DELETE'])
 @admin_required
 def delete_order(order_id):
-    db = load_db()
-    order = next((o for o in db.get('orders', []) if o.get('id') == order_id), None)
+    order = db_get_order(order_id)
     if order:
-        db.setdefault('deleted_items', []).append(deleted_record('order', order))
-    db['orders'] = [o for o in db.get('orders',[]) if o['id'] != order_id]
-    save_db(db)
+        db_insert_deleted_item(deleted_record('order', order))
+    db_delete_order(order_id)
     return jsonify({"ok": True})
 
 @app.route('/api/stats', methods=['GET'])
 @admin_required
 def get_stats():
+    now = time.time()
+    _cache = _stats_cache
+    if _cache['data'] is not None and now < _cache['expires']:
+        return jsonify(_cache['data'])
     payload = db_stats_payload()
-    # Keep legacy keys used by the frontend.
     payload["revenue_this_month"] = payload.get("revenue", 0)
+    _cache['data'] = payload
+    _cache['expires'] = now + 20  # cache for 20 seconds
     return jsonify(payload)
 
 @app.route('/api/analytics/daily', methods=['GET'])
@@ -3764,12 +4150,12 @@ def export_analytics_csv():
 @app.route('/api/share-links', methods=['GET'])
 @admin_required
 def get_share_links():
-    db = load_db()
     base_url = request.args.get('base_url', request.host_url.rstrip('/'))
+    schools = db_list_schools(public_only=False)
     links = []
-    for school in db.get('schools', []):
+    for school in schools:
         sid = school.get('id')
-        count = sum(1 for sub in db.get('submissions', []) if sub.get('school_id') == sid)
+        count = db_count_submissions(school_id=sid)
         links.append({
             "school_id": sid,
             "name": school.get('name', ''),
@@ -3789,16 +4175,15 @@ def get_settings():
 @app.route('/api/settings', methods=['PUT'])
 @admin_required
 def save_settings():
-    db = load_db()
+    settings = db_get_settings()
     data = request.json or {}
-    settings = db.setdefault('settings', {})
     for key in ['biz_name', 'owner', 'phone', 'email']:
         if key in data:
             settings[key] = clean_text(data[key], 200)
     if 'price_per_card' in data:
         settings['price_per_card'] = parse_float(data.get('price_per_card'), settings.get('price_per_card', 25), 0, 100000)
-    save_db(db)
-    return jsonify(db['settings'])
+    db_update_settings(settings)
+    return jsonify(settings)
 
 @app.route('/api/backups', methods=['GET'])
 @admin_required
@@ -5180,9 +5565,8 @@ def _auto_purge_old_trash():
     while True:
         try:
             cutoff = (datetime.now() - timedelta(days=TRASH_TTL_DAYS)).isoformat()
-            db = load_db()
             to_clean = [
-                x for x in db.get('deleted_items', [])
+                x for x in db_list_deleted_items()
                 if x.get('deleted_at', '') < cutoff
                 and not x.get('photos_purged')
             ]
@@ -5191,8 +5575,7 @@ def _auto_purge_old_trash():
                             len(to_clean), TRASH_TTL_DAYS)
                 for item in to_clean:
                     purge_deleted_item_files(item)
-                # Mark photos as purged — DB record stays forever
-                save_db(db)
+                    db_update_deleted_item(item)
                 logger.info("Auto-trash: photos cleaned, DB records kept")
         except Exception as e:
             logger.exception("Auto-trash cleanup failed: %s", e)
