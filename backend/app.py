@@ -5763,10 +5763,25 @@ def export_photos_zip_all():
           B001_Student.jpg
         No_School/
           Name_Only.jpg
+
+    For large datasets (>500 photos) prefer per-school export with class filter
+    to avoid gunicorn timeout. This endpoint is best for full backups.
     """
     schools = db_list_schools(public_only=False)
     school_map = {s['id']: s for s in schools}
     all_subs = db_list_submissions()  # all submissions via SQL, not full JSON blob load
+
+    # Warn early if the export is very large — client sees this before waiting
+    photo_count = sum(1 for s in all_subs if s.get('photo_path') and (os.path.exists(s['photo_path']) or _USE_R2))
+    if photo_count == 0:
+        return jsonify({"error": "No photos found"}), 404
+    if photo_count > int(os.environ.get('SCREENPLANT_MAX_ZIP_PHOTOS', '2000')):
+        return jsonify({
+            "error": f"Too many photos ({photo_count}) for a single ZIP. "
+                     "Use per-school export with class/section filters to download in batches.",
+            "photo_count": photo_count
+        }), 413
+
     photo_entries = []
     used_names = set()
     for sub in all_subs:
@@ -5785,9 +5800,6 @@ def export_photos_zip_all():
             file_name = f"{safe_uid}_{nm}{ext}" if safe_uid else f"{nm}{ext}"
         arcname = unique_zip_name(used_names, f"{folder}/{file_name}")
         photo_entries.append((arcname, p))
-
-    if not photo_entries:
-        return jsonify({"error": "No photos found"}), 404
 
     fname = f"ScreenPlant_All_Photos_{datetime.now().strftime('%Y%m%d_%H%M')}.zip"
 
