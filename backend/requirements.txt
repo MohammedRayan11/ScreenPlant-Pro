@@ -10,3 +10,4 @@ qrcode>=7.4
 numpy>=1.26
 gunicorn>=21.2
 boto3>=1.34
+gevent>=23.9.0
