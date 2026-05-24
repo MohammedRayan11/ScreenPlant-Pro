@@ -548,13 +548,22 @@ def pg_ro_connection():
     the 'rolling back returned connection' pool warnings caused by
     psycopg3 implicitly starting a transaction on the first query.
     Autocommit means no BEGIN is issued, so there is nothing to roll back.
+
+    Also safe to use for DDL statements (CREATE INDEX IF NOT EXISTS etc.)
+    since those require autocommit — they cannot run inside a transaction block.
     """
     pool = _get_pg_pool()
     if pool is not None:
         # Borrow a pooled connection and temporarily enable autocommit.
-        # The pool's check= callback will reset it on return if needed.
+        # psycopg3 may have implicitly issued BEGIN on a previously-used
+        # pooled connection (status INTRANS), which prevents flipping
+        # autocommit. We roll back first to clear any implicit transaction.
         conn = pool.getconn()
         try:
+            try:
+                conn.rollback()  # clear implicit BEGIN if connection is INTRANS
+            except Exception:
+                pass
             conn.autocommit = True
             yield conn
         except Exception as exc:
@@ -1009,12 +1018,31 @@ def init_db():
             db_initialized = True
             return
         _, _, Jsonb = pg_driver()
+
+        # ── Step 1: DDL in autocommit mode ────────────────────────────────────
+        # CREATE TABLE / CREATE INDEX IF NOT EXISTS must run outside a transaction
+        # block. Using pg_ro_connection() (autocommit=True) avoids the
+        # UniqueViolation on pg_class_relname_nsp_index that occurs when multiple
+        # Gunicorn workers race to create the same index concurrently inside a
+        # regular transaction — a common pattern on Railway/Heroku where all
+        # workers boot simultaneously against a shared Postgres instance.
+        with pg_ro_connection() as ddl_conn:
+            pg_create_tables(ddl_conn)
+
+        # ── Step 2: Seed data in a proper transaction ──────────────────────────
+        # Only insert legacy/default data if the DB is genuinely empty. This runs
+        # in a normal transactional connection so the seed is fully atomic.
         with pg_connection() as conn:
-            pg_create_tables(conn)
             if not pg_has_relational_data(conn):
-                payload = pg_load_legacy_state(conn) or load_sqlite_state() or load_json_state() or ensure_db_shape(DEFAULT_DB.copy())
+                payload = (
+                    pg_load_legacy_state(conn)
+                    or load_sqlite_state()
+                    or load_json_state()
+                    or ensure_db_shape(DEFAULT_DB.copy())
+                )
                 pg_insert_rows(conn, payload, Jsonb)
             conn.commit()
+
         db_initialized = True
 
 def recover_from_json_backup():
