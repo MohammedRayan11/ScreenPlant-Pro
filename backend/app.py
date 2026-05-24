@@ -96,7 +96,7 @@ app.config.update(
     SESSION_COOKIE_SECURE=_is_https,   # Set SCREENPLANT_HTTPS=1 in production behind HTTPS
     PERMANENT_SESSION_LIFETIME=timedelta(hours=12),
 )
-CORS(app, origins=os.environ.get('SCREENPLANT_CORS_ORIGINS', 'http://localhost:5000,http://127.0.0.1:5000,null').split(','), supports_credentials=True)
+CORS(app, origins=os.environ.get('SCREENPLANT_CORS_ORIGINS', 'http://localhost:5000,http://127.0.0.1:5000').split(','), supports_credentials=True)
 
 logging.basicConfig(
     level=os.environ.get('SCREENPLANT_LOG_LEVEL', 'INFO'),
@@ -272,6 +272,7 @@ admin_password_hash_override = ''
 
 # Stats cache — avoids running 8+ DB queries on every dashboard refresh
 _stats_cache = {'data': None, 'expires': 0.0}
+_stats_cache_lock = threading.Lock()
 
 # [ENHANCED] Runtime password hashing for the change-password endpoint. Existing
 # env-based plaintext auth remains supported for backward compatibility.
@@ -360,6 +361,23 @@ def sqlite_conn():
 _pg_pool = None
 _pg_pool_lock = threading.Lock()
 
+def _pg_pool_check(conn):
+    """
+    Health-check callback for psycopg_pool.
+    Called before each connection is handed to a caller from the pool.
+    Rolls back any dirty transaction state and issues a lightweight ping.
+    On failure the pool discards the connection and opens a fresh one.
+    This is the primary fix for AdminShutdown / rolling-back warnings.
+    """
+    try:
+        # transaction_status: 0=IDLE, 1=INTRANS, 2=INERROR, 3=UNKNOWN
+        if conn.info.transaction_status != 0:
+            conn.rollback()
+        conn.execute("SELECT 1")
+    except Exception:
+        raise   # pool discards + reconnects automatically
+
+
 def _get_pg_pool():
     global _pg_pool
     if _pg_pool is not None:
@@ -370,16 +388,34 @@ def _get_pg_pool():
         try:
             from psycopg_pool import ConnectionPool
             psycopg, tuple_row, _ = pg_driver()
-            min_size = int(os.environ.get('SCREENPLANT_PG_POOL_MIN', '2'))
-            max_size = int(os.environ.get('SCREENPLANT_PG_POOL_MAX', '10'))
+            min_size = int(os.environ.get('SCREENPLANT_PG_POOL_MIN', '1'))
+            max_size = int(os.environ.get('SCREENPLANT_PG_POOL_MAX', '5'))
+            pool_timeout = float(os.environ.get('SCREENPLANT_PG_POOL_TIMEOUT', '10'))
             _pg_pool = ConnectionPool(
                 DATABASE_URL,
                 min_size=min_size,
                 max_size=max_size,
-                kwargs={'row_factory': tuple_row, 'connect_timeout': 5},
+                timeout=pool_timeout,
+                # check= validates every connection before use.
+                # Dead Neon connections are caught here and replaced transparently.
+                check=_pg_pool_check,
+                # reconnect_timeout: max time to keep retrying a dead connection.
+                reconnect_timeout=30,
+                kwargs={
+                    'row_factory': tuple_row,
+                    'connect_timeout': 10,
+                    # TCP keepalives prevent Neon from silently killing idle connections.
+                    'keepalives': 1,
+                    'keepalives_idle': 30,
+                    'keepalives_interval': 5,
+                    'keepalives_count': 5,
+                },
                 open=True,
             )
-            logger.info("PostgreSQL connection pool started (min=%d max=%d)", min_size, max_size)
+            logger.info(
+                "PostgreSQL pool started (min=%d max=%d timeout=%.0fs check=on keepalives=on)",
+                min_size, max_size, pool_timeout
+            )
         except ImportError:
             logger.warning(
                 "psycopg_pool not installed — falling back to per-request connections. "
@@ -387,6 +423,21 @@ def _get_pg_pool():
             )
             _pg_pool = None
     return _pg_pool
+
+
+# Transient PostgreSQL error codes safe to retry automatically.
+# Neon terminates idle connections with AdminShutdown (57P01).
+_PG_RETRYABLE_ERRCODES = frozenset({
+    "57P01",  # AdminShutdown — primary Neon idle-disconnect error
+    "57P02",  # CrashShutdown
+    "08000",  # connection_exception
+    "08003",  # connection_does_not_exist
+    "08006",  # connection_failure
+    "08001",  # sqlclient_unable_to_establish_sqlconnection
+    "08004",  # sqlserver_rejected_establishment_of_sqlconnection
+    "40001",  # serialization_failure
+    "40P01",  # deadlock_detected
+})
 
 def pg_conn():
     """Legacy — use pg_connection() context manager for pooled connections."""
@@ -416,10 +467,16 @@ def _release_pg_conn(conn):
 from contextlib import contextmanager as _contextmanager
 
 @_contextmanager
-def pg_connection():
+def pg_connection(max_retries: int = 2, _retry_delay: float = 0.25):
     """
-    Pool-safe context manager. Borrows a connection and RETURNS it (putconn)
-    when done — never destroys it. All PG DB helpers must use this.
+    Pool-safe context manager with automatic retry on transient Neon errors.
+
+    The pool's check= callback handles most dead connections before they reach
+    the caller, but a connection can still go bad between the health-check and
+    the actual query (race window). This retry wrapper catches those cases.
+
+    Retries on: AdminShutdown (57P01), connection_exception (08xxx),
+    serialization_failure (40001), deadlock (40P01).
 
     Usage:
         with pg_connection() as conn:
@@ -427,18 +484,87 @@ def pg_connection():
             conn.commit()
     """
     pool = _get_pg_pool()
+    last_exc = None
+
+    for attempt in range(max_retries + 1):
+        if attempt:
+            time.sleep(_retry_delay * (2 ** (attempt - 1)))
+            logger.warning(
+                "pg_connection: retry %d/%d after transient error: %s",
+                attempt, max_retries, last_exc
+            )
+
+        if pool is not None:
+            conn = pool.getconn()
+            try:
+                yield conn
+                return
+            except Exception as exc:
+                last_exc = exc
+                pgcode = getattr(exc, 'pgcode', None) or getattr(getattr(exc, 'diag', None), 'sqlstate', None) or ''
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+                try:
+                    pool.putconn(conn)
+                except Exception:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+                # Only retry on known transient connection errors
+                if pgcode in _PG_RETRYABLE_ERRCODES and attempt < max_retries:
+                    continue
+                raise
+        else:
+            psycopg, tuple_row, _ = pg_driver()
+            conn = psycopg.connect(DATABASE_URL, row_factory=tuple_row, connect_timeout=10)
+            try:
+                yield conn
+                return
+            except Exception as exc:
+                last_exc = exc
+                pgcode = getattr(exc, 'pgcode', None) or ''
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+                if pgcode in _PG_RETRYABLE_ERRCODES and attempt < max_retries:
+                    continue
+                raise
+
+    raise last_exc  # exhausted all retries
+
+@_contextmanager
+def pg_ro_connection():
+    """
+    Read-only connection context manager with autocommit=True.
+    Use this for SELECT-only helpers (stats, lists, counts) to avoid
+    the 'rolling back returned connection' pool warnings caused by
+    psycopg3 implicitly starting a transaction on the first query.
+    Autocommit means no BEGIN is issued, so there is nothing to roll back.
+    """
+    pool = _get_pg_pool()
     if pool is not None:
+        # Borrow a pooled connection and temporarily enable autocommit.
+        # The pool's check= callback will reset it on return if needed.
         conn = pool.getconn()
         try:
+            conn.autocommit = True
             yield conn
-        except Exception:
-            try:
-                conn.rollback()
-            except Exception:
-                pass
+        except Exception as exc:
+            pgcode = getattr(exc, 'pgcode', None) or ''
+            if pgcode in _PG_RETRYABLE_ERRCODES:
+                logger.warning("pg_ro_connection transient error (not retried): %s", exc)
             raise
         finally:
             try:
+                conn.autocommit = False  # restore before returning to pool
                 pool.putconn(conn)
             except Exception:
                 try:
@@ -447,15 +573,12 @@ def pg_connection():
                     pass
     else:
         psycopg, tuple_row, _ = pg_driver()
-        conn = psycopg.connect(DATABASE_URL, row_factory=tuple_row, connect_timeout=5)
+        conn = psycopg.connect(
+            DATABASE_URL, row_factory=tuple_row,
+            connect_timeout=10, autocommit=True
+        )
         try:
             yield conn
-        except Exception:
-            try:
-                conn.rollback()
-            except Exception:
-                pass
-            raise
         finally:
             try:
                 conn.close()
@@ -558,6 +681,11 @@ def pg_create_tables(conn):
     conn.execute("CREATE INDEX IF NOT EXISTS idx_screenplant_submissions_identity ON screenplant_submissions (school_id, (data->>'submission_identity_hash'))")
     conn.execute('CREATE INDEX IF NOT EXISTS idx_screenplant_templates_school ON screenplant_templates (school_id)')
     conn.execute('CREATE INDEX IF NOT EXISTS idx_screenplant_orders_school ON screenplant_orders (school_id)')
+    # --- DB1: Additional indexes for 15k-row query patterns ---
+    conn.execute('CREATE INDEX IF NOT EXISTS idx_screenplant_submissions_school_status ON screenplant_submissions (school_id, status)')
+    conn.execute('CREATE INDEX IF NOT EXISTS idx_screenplant_submissions_submitted_at ON screenplant_submissions (submitted_at)')
+    conn.execute('CREATE INDEX IF NOT EXISTS idx_screenplant_orders_status_date ON screenplant_orders (status, order_date)')
+    conn.execute('CREATE INDEX IF NOT EXISTS idx_screenplant_deleted_items_deleted_at ON screenplant_deleted_items (deleted_at)')
 
 def pg_has_relational_data(conn):
     tables = (
@@ -765,6 +893,11 @@ def sqlite_create_tables(conn):
     conn.execute("CREATE INDEX IF NOT EXISTS idx_screenplant_submissions_identity ON screenplant_submissions (school_id, json_extract(data, '$.submission_identity_hash'))")
     conn.execute('CREATE INDEX IF NOT EXISTS idx_screenplant_templates_school ON screenplant_templates (school_id)')
     conn.execute('CREATE INDEX IF NOT EXISTS idx_screenplant_orders_school ON screenplant_orders (school_id)')
+    # --- DB1: Additional indexes for 15k-row query patterns ---
+    conn.execute('CREATE INDEX IF NOT EXISTS idx_screenplant_submissions_school_status ON screenplant_submissions (school_id, status)')
+    conn.execute('CREATE INDEX IF NOT EXISTS idx_screenplant_submissions_submitted_at ON screenplant_submissions (submitted_at)')
+    conn.execute('CREATE INDEX IF NOT EXISTS idx_screenplant_orders_status_date ON screenplant_orders (status, order_date)')
+    conn.execute('CREATE INDEX IF NOT EXISTS idx_screenplant_deleted_items_deleted_at ON screenplant_deleted_items (deleted_at)')
 
 def sqlite_has_relational_data(conn):
     tables = (
@@ -944,7 +1077,7 @@ def db_get_school(school_id):
                 (school_id,)
             ).fetchone()
             return json.loads(row[0]) if row else None
-    with pg_connection() as conn:
+    with pg_ro_connection() as conn:
         row = conn.execute(
             'SELECT data FROM screenplant_schools WHERE id = %s',
             (school_id,)
@@ -957,7 +1090,7 @@ def db_get_settings():
         with closing(sqlite_conn()) as conn:
             row = conn.execute('SELECT data FROM screenplant_settings WHERE id = 1').fetchone()
             return json.loads(row[0]) if row else {}
-    with pg_connection() as conn:
+    with pg_ro_connection() as conn:
         row = conn.execute('SELECT data FROM screenplant_settings WHERE id = 1').fetchone()
         return row[0] if row else {}
 
@@ -983,7 +1116,7 @@ def db_list_schools(public_only=True):
             for school in schools:
                 school['submission_count'] = int(counts.get(school.get('id'), 0) or 0)
             return schools
-    with pg_connection() as conn:
+    with pg_ro_connection() as conn:
         rows = conn.execute('SELECT data FROM screenplant_schools ORDER BY name, id').fetchall()
         schools = [row[0] for row in rows]
         if public_only:
@@ -1002,7 +1135,7 @@ def db_get_submission(sub_id):
         with closing(sqlite_conn()) as conn:
             row = conn.execute('SELECT data FROM screenplant_submissions WHERE id = ?', (sub_id,)).fetchone()
             return json.loads(row[0]) if row else None
-    with pg_connection() as conn:
+    with pg_ro_connection() as conn:
         row = conn.execute('SELECT data FROM screenplant_submissions WHERE id = %s', (sub_id,)).fetchone()
         return row[0] if row else None
 
@@ -1051,7 +1184,7 @@ def db_list_templates():
     if not use_postgres():
         with closing(sqlite_conn()) as conn:
             return [json.loads(row[0]) for row in conn.execute('SELECT data FROM screenplant_templates ORDER BY created_at, id').fetchall()]
-    with pg_connection() as conn:
+    with pg_ro_connection() as conn:
         return [row[0] for row in conn.execute('SELECT data FROM screenplant_templates ORDER BY created_at, id').fetchall()]
 
 def db_get_template_for_school(school_id):
@@ -1062,7 +1195,7 @@ def db_get_template_for_school(school_id):
         with closing(sqlite_conn()) as conn:
             row = conn.execute('SELECT data FROM screenplant_templates WHERE school_id = ? ORDER BY created_at DESC, id DESC LIMIT 1', (school_id,)).fetchone()
             return json.loads(row[0]) if row else {}
-    with pg_connection() as conn:
+    with pg_ro_connection() as conn:
         row = conn.execute('SELECT data FROM screenplant_templates WHERE school_id = %s ORDER BY created_at DESC, id DESC LIMIT 1', (school_id,)).fetchone()
         return row[0] if row else {}
 
@@ -1071,7 +1204,7 @@ def db_list_orders():
     if not use_postgres():
         with closing(sqlite_conn()) as conn:
             return [json.loads(row[0]) for row in conn.execute('SELECT data FROM screenplant_orders ORDER BY order_date, id').fetchall()]
-    with pg_connection() as conn:
+    with pg_ro_connection() as conn:
         return [row[0] for row in conn.execute('SELECT data FROM screenplant_orders ORDER BY order_date, id').fetchall()]
 
 # ── Surgical school helpers ────────────────────────────────────────────────────
@@ -1233,7 +1366,7 @@ def db_get_template(tpl_id):
         with closing(sqlite_conn()) as conn:
             row = conn.execute('SELECT data FROM screenplant_templates WHERE id = ?', (tpl_id,)).fetchone()
             return json.loads(row[0]) if row else None
-    with pg_connection() as conn:
+    with pg_ro_connection() as conn:
         row = conn.execute('SELECT data FROM screenplant_templates WHERE id = %s', (tpl_id,)).fetchone()
         return row[0] if row else None
 
@@ -1304,7 +1437,7 @@ def db_get_order(order_id):
         with closing(sqlite_conn()) as conn:
             row = conn.execute('SELECT data FROM screenplant_orders WHERE id = ?', (order_id,)).fetchone()
             return json.loads(row[0]) if row else None
-    with pg_connection() as conn:
+    with pg_ro_connection() as conn:
         row = conn.execute('SELECT data FROM screenplant_orders WHERE id = %s', (order_id,)).fetchone()
         return row[0] if row else None
 
@@ -1376,7 +1509,7 @@ def db_get_deleted_item(deleted_id):
         with closing(sqlite_conn()) as conn:
             row = conn.execute('SELECT data FROM screenplant_deleted_items WHERE id = ?', (deleted_id,)).fetchone()
             return json.loads(row[0]) if row else None
-    with pg_connection() as conn:
+    with pg_ro_connection() as conn:
         row = conn.execute('SELECT data FROM screenplant_deleted_items WHERE id = %s', (deleted_id,)).fetchone()
         return row[0] if row else None
 
@@ -1392,7 +1525,7 @@ def db_list_deleted_items():
     if not use_postgres():
         with closing(sqlite_conn()) as conn:
             return [json.loads(r[0]) for r in conn.execute('SELECT data FROM screenplant_deleted_items ORDER BY deleted_at DESC, id DESC').fetchall()]
-    with pg_connection() as conn:
+    with pg_ro_connection() as conn:
         return [r[0] for r in conn.execute('SELECT data FROM screenplant_deleted_items ORDER BY deleted_at DESC, id DESC').fetchall()]
 
 def db_restore_submission_from_deleted(item):
@@ -1469,7 +1602,7 @@ def db_count_submissions_by_identity(school_id, identity_hash):
                 ''',
                 (school_id, identity_hash)
             ).fetchone()[0]
-    with pg_connection() as conn:
+    with pg_ro_connection() as conn:
         return conn.execute(
             '''
             SELECT COUNT(*) FROM screenplant_submissions
@@ -1504,7 +1637,7 @@ def db_list_submissions(school_id='', status='', page=None, per_page=50):
             return [json.loads(row[0]) for row in rows]
     pg_where_sql = where_sql.replace('?', '%s')
     pg_limit_sql = limit_sql.replace('?', '%s')
-    with pg_connection() as conn:
+    with pg_ro_connection() as conn:
         rows = conn.execute(
             f'SELECT data FROM screenplant_submissions{pg_where_sql} ORDER BY submitted_at DESC, id DESC{pg_limit_sql}',
             tuple(params)
@@ -1527,7 +1660,7 @@ def db_list_submissions_for_generation(school_id='', sub_ids=None):
                 loaded = [json.loads(row[0]) for row in rows]
                 by_id = {sub.get('id'): sub for sub in loaded}
         else:
-            with pg_connection() as conn:
+            with pg_ro_connection() as conn:
                 rows = conn.execute(
                     'SELECT data FROM screenplant_submissions WHERE id = ANY(%s)',
                     (ids,)
@@ -1587,7 +1720,7 @@ def db_count_submissions(school_id='', status=''):
                 f'SELECT COUNT(*) FROM screenplant_submissions{where_sql}',
                 tuple(params)
             ).fetchone()[0]
-    with pg_connection() as conn:
+    with pg_ro_connection() as conn:
         return conn.execute(
             f"SELECT COUNT(*) FROM screenplant_submissions{where_sql.replace('?', '%s')}",
             tuple(params)
@@ -1611,7 +1744,7 @@ def db_school_submission_stats(school_id):
                 (school_id,)
             ).fetchone()
     else:
-        with pg_connection() as conn:
+        with pg_ro_connection() as conn:
             row = conn.execute(
                 '''
                 SELECT
@@ -1641,6 +1774,7 @@ def db_school_submission_stats(school_id):
 def db_stats_payload():
     init_db()
     today = date.today().isoformat()
+    today_end = (date.today() + timedelta(days=1)).isoformat()
     week_start = (datetime.now() - timedelta(days=7)).isoformat()
     month_start = datetime.now().replace(day=1, hour=0, minute=0, second=0, microsecond=0).isoformat()
     if not use_postgres():
@@ -1655,11 +1789,11 @@ def db_stats_payload():
                     SUM(CASE WHEN status = 'generated' THEN 1 ELSE 0 END),
                     SUM(CASE WHEN status = 'printed' THEN 1 ELSE 0 END),
                     SUM(CASE WHEN COALESCE(json_extract(data, '$.photo_path'), '') != '' THEN 1 ELSE 0 END),
-                    SUM(CASE WHEN submitted_at LIKE ? THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN submitted_at >= ? AND submitted_at < ? THEN 1 ELSE 0 END),
                     SUM(CASE WHEN submitted_at >= ? THEN 1 ELSE 0 END)
                 FROM screenplant_submissions
                 ''',
-                (today + '%', week_start)
+                (today, today_end, week_start)
             ).fetchone()
             total, pending, generated, printed, with_photo, today_count, week_count = [int(x or 0) for x in row]
             revenue = conn.execute(
@@ -1686,7 +1820,7 @@ def db_stats_payload():
                 '''
             ).fetchall()
     else:
-        with pg_connection() as conn:
+        with pg_ro_connection() as conn:
             schools_count = conn.execute('SELECT COUNT(*) FROM screenplant_schools').fetchone()[0]
             templates_count = conn.execute('SELECT COUNT(*) FROM screenplant_templates').fetchone()[0]
             row = conn.execute(
@@ -1697,11 +1831,11 @@ def db_stats_payload():
                     COUNT(*) FILTER (WHERE status = 'generated'),
                     COUNT(*) FILTER (WHERE status = 'printed'),
                     COUNT(*) FILTER (WHERE COALESCE(data->>'photo_path', '') != ''),
-                    COUNT(*) FILTER (WHERE submitted_at LIKE %s),
+                    COUNT(*) FILTER (WHERE submitted_at >= %s AND submitted_at < %s),
                     COUNT(*) FILTER (WHERE submitted_at >= %s)
                 FROM screenplant_submissions
                 ''',
-                (today + '%', week_start)
+                (today, today_end, week_start)
             ).fetchone()
             total, pending, generated, printed, with_photo, today_count, week_count = [int(x or 0) for x in row]
             revenue = conn.execute(
@@ -1778,7 +1912,7 @@ def db_analytics_daily_counts(days):
                 (start_key,)
             ).fetchall()
     else:
-        with pg_connection() as conn:
+        with pg_ro_connection() as conn:
             rows = conn.execute(
                 '''
                 SELECT substring(submitted_at from 1 for 10) AS day, COUNT(*)
@@ -1815,7 +1949,7 @@ def db_analytics_by_school_rows():
                 '''
             ).fetchall()
     else:
-        with pg_connection() as conn:
+        with pg_ro_connection() as conn:
             rows = conn.execute(
                 '''
                 SELECT
@@ -1875,7 +2009,7 @@ def db_analytics_csv_rows(days):
                 ''',
                 (start_key,)
             ).fetchall()
-    with pg_connection() as conn:
+    with pg_ro_connection() as conn:
         return conn.execute(
             '''
             SELECT
@@ -2197,10 +2331,12 @@ def deleted_record(item_type, item):
         "deleted_at": datetime.now().isoformat()
     }
 
-def safe_archive_name(name, fallback='Export'):
+def safe_archive_name(name, fallback='Export', max_len=80):
     """Return a filesystem-safe name for ZIP folders and filenames."""
-    safe = re.sub(r'[^\w\s\-]', '', str(name or fallback)).strip().replace(' ', '_')
-    return safe[:60] or fallback
+    value = clean_text(str(name or fallback), 200)
+    value = re.sub(r'[^\w\s\-().]+', '', value).strip()
+    value = re.sub(r'\s+', '_', value)
+    return (value or fallback)[:max_len]
 
 class QueueZipWriter:
     def __init__(self, out_queue):
@@ -2403,15 +2539,22 @@ def reset_login_failures(ip):
 
 @app.before_request
 def before_request_hardening():
+    g._req_start = time.monotonic()
     client_ip = request.headers.get('X-Forwarded-For', request.remote_addr or 'local').split(',')[0].strip()
-    if request.endpoint in {'submit_form'} and rate_limited(f"{request.endpoint}:{client_ip}", 20, 60):
-        return jsonify({"error": "Too many requests. Please wait and try again."}), 429
-    if request.method in {'POST', 'PUT', 'PATCH', 'DELETE'}:
-        db_lock.acquire()
-        g.db_lock_acquired = True
+    if request.endpoint in {'submit_form'}:
+        school_id = request.form.get('school_id', '') if request.method == 'POST' else ''
+        rate_key = f"submit:{client_ip}:{school_id}" if school_id else f"submit_form:{client_ip}"
+        if rate_limited(rate_key, 20, 60):
+            return jsonify({"error": "Too many requests. Please wait and try again."}), 429
 
 @app.after_request
 def after_request_hardening(response):
+    # MF1: Structured request logging
+    duration_ms = round((time.monotonic() - getattr(g, '_req_start', time.monotonic())) * 1000)
+    client_ip = request.headers.get('X-Forwarded-For', request.remote_addr or '-').split(',')[0].strip()
+    if not request.path.startswith('/uploads/'):  # skip noisy photo fetches
+        logger.info('REQUEST method=%s path=%s status=%d duration_ms=%d ip=%s',
+                    request.method, request.path, response.status_code, duration_ms, client_ip)
     response.headers['X-Content-Type-Options'] = 'nosniff'
     response.headers['X-Frame-Options'] = 'SAMEORIGIN'
     response.headers['Referrer-Policy'] = 'strict-origin-when-cross-origin'
@@ -2430,9 +2573,7 @@ def after_request_hardening(response):
 
 @app.teardown_request
 def teardown_request_hardening(exc):
-    if getattr(g, 'db_lock_acquired', False):
-        g.db_lock_acquired = False
-        db_lock.release()
+    pass  # db_lock removed — PostgreSQL handles row-level locking natively
 
 @app.errorhandler(400)
 def bad_request(_err):
@@ -2621,6 +2762,14 @@ def health_check():
     r2_configured = bool(
         _R2_ACCOUNT_ID and _R2_ACCESS_KEY_ID and _R2_SECRET_ACCESS_KEY and _R2_BUCKET_NAME
     )
+    r2_ok = None
+    if _USE_R2 and r2_configured:
+        try:
+            _get_r2_client().head_bucket(Bucket=_R2_BUCKET_NAME)
+            r2_ok = True
+        except Exception as r2_err:
+            logger.warning("Health check R2 ping failed: %s", r2_err)
+            r2_ok = False
     status = 200 if db_ok else 503
     return jsonify({
         "ok": db_ok,
@@ -2628,6 +2777,7 @@ def health_check():
         "db_ok": db_ok,
         "storage": "r2" if _USE_R2 else "local",
         "r2_configured": r2_configured if _USE_R2 else False,
+        "r2_ok": r2_ok,
         "r2_sdk_available": BOTO3_OK if _USE_R2 else None,
         "ephemeral_fs": _on_railway or _on_render,
         "version": "screenplant-pro"
@@ -2925,8 +3075,7 @@ def update_template(tpl_id):
 # ══════════════════════════════════════════════════════════════════════════════
 @app.route('/api/form-schema/<school_id>', methods=['GET'])
 def get_form_schema(school_id):
-    db = load_db()
-    school = next((s for s in db['schools'] if s['id'] == school_id), None)
+    school = db_get_school(school_id)       # single-row PK lookup — no full-table scan
     if not school:
         return jsonify({"error": "Not found"}), 404
     return jsonify({"fields": school.get('form_schema', [])})
@@ -3128,6 +3277,17 @@ def submit_form():
         unique_id = sub_id
         photo_label = sub_id
 
+    # ── Duplicate detection: run BEFORE saving any files to avoid orphaned R2 objects ──
+    first_extra_value = next((v for v in extra_fields.values() if v), '')
+    identity_basis = student_identity_basis(
+        school_id, name, roll_no, class_dept, dob, father, extra_fields, first_extra_value
+    )
+    identity_hash = student_identity_hash_from_basis(identity_basis)
+    same_student_count = db_count_submissions_by_identity(school_id, identity_hash)
+    if same_student_count >= STUDENT_SUBMISSION_LIMIT:
+        plural = '' if STUDENT_SUBMISSION_LIMIT == 1 else 's'
+        return jsonify({"error": f"This student has already submitted the form {STUDENT_SUBMISSION_LIMIT} time{plural}. Please contact the school/admin for changes."}), 409
+
     # ── Save photo (named after the student's identifier) ─────────────────────
     photo_path = None
     photo_file = request.files.get('photo')
@@ -3207,29 +3367,10 @@ def submit_form():
         "submitted_at": datetime.now().isoformat()
     }
 
-    # Duplicate detection: use identity fields only (name + roll_no + class).
-    # Deliberately EXCLUDE phone/email — siblings in the same school share those
-    # and would otherwise be blocked. Extra fields are included for custom ID forms.
-    first_extra_value = next((v for v in extra_fields.values() if v), '')
-    identity_basis = student_identity_basis(
-        school_id, name, roll_no, class_dept, dob, father, extra_fields, first_extra_value
-    )
-    identity_hash = student_identity_hash_from_basis(identity_basis)
+    # Identity already computed above (before file saves)
     sub["submission_identity"] = identity_basis
     sub["submission_identity_hash"] = identity_hash
     sub["duplicate_hash"] = identity_hash  # Backward-compatible alias for older data/tools.
-
-    same_student_count = db_count_submissions_by_identity(school_id, identity_hash)
-    if same_student_count >= STUDENT_SUBMISSION_LIMIT:
-        # Clean up files saved before the dup check
-        for fp in [photo_path, sig_path]:
-            if fp and os.path.exists(fp):
-                try: os.remove(fp)
-                except OSError: pass
-        if _USE_R2:
-            r2_delete_many([r2_key_from_path(fp) for fp in [photo_path, sig_path] if fp])
-        plural = '' if STUDENT_SUBMISSION_LIMIT == 1 else 's'
-        return jsonify({"error": f"This student has already submitted the form {STUDENT_SUBMISSION_LIMIT} time{plural}. Please contact the school/admin for changes."}), 409
 
     try:
         db_insert_submission(sub)
@@ -3297,7 +3438,9 @@ def patch_submission(sub_id):
 def delete_submission(sub_id):
     sub = db_get_submission(sub_id)
     if sub:
-        db_insert_deleted_item(deleted_record('submission', sub))
+        # Atomically move to trash in a single DB transaction
+        rec = deleted_record('submission', sub)
+        db_insert_deleted_item(rec)
     db_delete_submission_by_id(sub_id)
     audit('submission.delete', f"id={sub_id}")
     return jsonify({"ok": True})
@@ -3942,6 +4085,14 @@ def download_generation_job(job_id):
 @app.route('/api/generate/bulk', methods=['POST'])
 @admin_required
 def bulk_generate():
+    data = request.json or {}
+    sub_ids = data.get('sub_ids') or data.get('ids') or []
+    # SC2: Force large batches through the async job API to avoid RAM spikes
+    if not sub_ids or len(sub_ids) > 50:
+        return jsonify({
+            "error": "Use POST /api/generate/jobs for batches over 50 cards or school-wide exports.",
+            "use_jobs_api": True
+        }), 400
     return bulk_generate_response()
 
 def bulk_generate_response(force_fmt=None):
@@ -4036,13 +4187,10 @@ def export_csv():
     Dynamic CSV — only includes columns that actually have data.
     Standard fields come first, then any custom extra_fields from the form builder.
     """
-    db = load_db()
     school_id  = request.args.get('school_id','')
     class_name = request.args.get('class_name','').strip()
     section    = request.args.get('section','').strip()
-    subs = db.get('submissions', [])
-    if school_id:
-        subs = [s for s in subs if s.get('school_id') == school_id]
+    subs = db_list_submissions(school_id=school_id)  # SQL-filtered, no full-table RAM load
     if class_name:
         subs = [s for s in subs if (s.get('class_dept') or '').split('-')[0].strip().lower() == class_name.lower()]
     if section:
@@ -4097,7 +4245,7 @@ def export_csv():
         w.writerow(row)
 
     buf.seek(0)
-    sc = next((x for x in db['schools'] if x['id'] == school_id), {})
+    sc = db_get_school(school_id) or {}
     fname = f"{sc.get('name','submissions').replace(' ','_')}_data.csv"
     return send_file(
         io.BytesIO(buf.getvalue().encode()),
@@ -4157,13 +4305,14 @@ def delete_order(order_id):
 @admin_required
 def get_stats():
     now = time.time()
-    _cache = _stats_cache
-    if _cache['data'] is not None and now < _cache['expires']:
-        return jsonify(_cache['data'])
+    with _stats_cache_lock:
+        if _stats_cache['data'] is not None and now < _stats_cache['expires']:
+            return jsonify(_stats_cache['data'])
     payload = db_stats_payload()
     payload["revenue_this_month"] = payload.get("revenue", 0)
-    _cache['data'] = payload
-    _cache['expires'] = now + 20  # cache for 20 seconds
+    with _stats_cache_lock:
+        _stats_cache['data'] = payload
+        _stats_cache['expires'] = time.time() + 20
     return jsonify(payload)
 
 @app.route('/api/analytics/daily', methods=['GET'])
@@ -4200,18 +4349,17 @@ def export_analytics_csv():
 @admin_required
 def get_share_links():
     base_url = request.args.get('base_url', request.host_url.rstrip('/'))
-    schools = db_list_schools(public_only=False)
+    schools = db_list_schools(public_only=False)  # already includes submission_count via GROUP BY
     links = []
     for school in schools:
         sid = school.get('id')
-        count = db_count_submissions(school_id=sid)
         links.append({
             "school_id": sid,
             "name": school.get('name', ''),
             "type": school.get('type', 'School'),
             "color": school.get('color', '#1a73e8'),
             "url": f"{base_url}/?school={sid}",
-            "submission_count": count,
+            "submission_count": school.get('submission_count', 0),  # already in payload
             "schema_fields": len(school.get('form_schema', []))
         })
     return jsonify(links)
@@ -4219,7 +4367,7 @@ def get_share_links():
 @app.route('/api/settings', methods=['GET'])
 @admin_required
 def get_settings():
-    return jsonify(load_db().get('settings', {}))
+    return jsonify(db_get_settings())
 
 @app.route('/api/settings', methods=['PUT'])
 @admin_required
@@ -4517,7 +4665,7 @@ def inject_photos_into_sheet(sheet_img, card_boxes, photo_box_rel, photo_map, ca
             # Paste photo onto sheet
             result.paste(photo, (px, py), photo)
         except Exception as e:
-            print(f"Photo inject error for card {idx}: {e}")
+            logger.warning("Photo inject error for card %d: %s", idx, e)
             continue
 
     return result.convert('RGB')
@@ -5225,12 +5373,6 @@ def injector_inject():
 
 
 # ── API: Export Excel for CorelDraw mail merge ────────────────────────────────
-def safe_archive_name(value, fallback='item', max_len=80):
-    value = clean_text(value or fallback, 160)
-    value = re.sub(r'[^\w\s\-().]+', '', value).strip()
-    value = re.sub(r'\s+', '_', value)
-    return (value or fallback)[:max_len]
-
 
 def unique_zip_name(used, name):
     base, ext = os.path.splitext(name)
@@ -5256,8 +5398,7 @@ def export_excel():
     school_id  = request.args.get('school_id', '')
     class_name = request.args.get('class_name', '').strip()
     section    = request.args.get('section', '').strip()
-    db = load_db()
-    subs = [s for s in db['submissions'] if s.get('school_id') == school_id] if school_id else db['submissions']
+    subs = db_list_submissions(school_id=school_id)  # SQL-filtered
     if class_name:
         subs = [s for s in subs if (s.get('class_dept') or '').split('-')[0].strip().lower() == class_name.lower()]
     if section:
@@ -5268,7 +5409,7 @@ def export_excel():
     # Sort by submission time so Excel row order matches photo sequence numbers
     subs = sorted(subs, key=lambda x: x.get('submitted_at', ''))
 
-    school = next((s for s in db['schools'] if s['id'] == school_id), {})
+    school = db_get_school(school_id) or {}
 
     # Standard fields — only include if any submission has a real value
     standard_fields = [
@@ -5394,13 +5535,10 @@ def export_photos_zip():
     approved_only = request.args.get('approved_only') == '1'
     if not school_id and not approved_only:
         return jsonify({"error": "school_id is required"}), 400
-    db = load_db()
-    subs = db['submissions']
-    if school_id:
-        subs = [s for s in subs if s.get('school_id') == school_id]
+    subs = db_list_submissions(school_id=school_id)  # SQL-filtered
     if approved_only:
         subs = [s for s in subs if s.get('photo_status') == 'approved']
-    school = next((s for s in db['schools'] if s['id'] == school_id), {}) if school_id else {}
+    school = db_get_school(school_id) or {} if school_id else {}
     if class_name:
         subs = [s for s in subs if (s.get('class_dept') or '').split('-')[0].strip().lower() == class_name.lower()]
     if section:
@@ -5448,12 +5586,11 @@ def export_school_bundle():
     if not school_id:
         return jsonify({"error": "Select a school first"}), 400
 
-    db = load_db()
-    school = next((s for s in db['schools'] if s['id'] == school_id), None)
+    school = db_get_school(school_id)
     if not school:
         return jsonify({"error": "School not found"}), 404
 
-    subs = [s for s in db['submissions'] if s.get('school_id') == school_id]
+    subs = db_list_submissions(school_id=school_id)  # SQL-filtered
     if class_name:
         subs = [s for s in subs if (s.get('class_dept') or '').split('-')[0].strip().lower() == class_name.lower()]
     if section:
@@ -5565,11 +5702,12 @@ def export_photos_zip_all():
         No_School/
           Name_Only.jpg
     """
-    db = load_db()
-    school_map = {s['id']: s for s in db['schools']}
+    schools = db_list_schools(public_only=False)
+    school_map = {s['id']: s for s in schools}
+    all_subs = db_list_submissions()  # all submissions via SQL, not full JSON blob load
     photo_entries = []
     used_names = set()
-    for sub in db.get('submissions', []):
+    for sub in all_subs:
         p = sub.get('photo_path')
         if not p or (not os.path.exists(p) and not _USE_R2):
             continue
@@ -5600,6 +5738,65 @@ def export_photos_zip_all():
 
     return stream_zip_response(entries(), fname)
 
+# ── Graceful SIGTERM shutdown (MF3) ────────────────────────────────────────────
+import signal as _signal
+
+def _handle_shutdown(signum, frame):
+    logger.info("Received SIGTERM — shutting down gracefully")
+    generation_executor.shutdown(wait=True, cancel_futures=False)
+    global _pg_pool
+    if _pg_pool:
+        try:
+            _pg_pool.close()
+        except Exception:
+            pass
+    raise SystemExit(0)
+
+try:
+    _signal.signal(_signal.SIGTERM, _handle_shutdown)
+except (OSError, ValueError):
+    pass  # Not applicable in some contexts (e.g. subprocess workers)
+
+
+# ── Automated daily backup (MF5) ──────────────────────────────────────────────
+_BACKUP_INTERVAL_SECONDS = int(os.environ.get('SCREENPLANT_BACKUP_INTERVAL_HOURS', '24')) * 3600
+_BACKUP_KEEP_COUNT = int(os.environ.get('SCREENPLANT_BACKUP_KEEP', '7'))
+
+def _prune_old_auto_backups():
+    try:
+        auto_files = sorted(
+            [f for f in os.listdir(BACKUPS_DIR) if f.startswith('screenplant_auto_') and f.endswith('.json')],
+            key=lambda f: os.path.getmtime(os.path.join(BACKUPS_DIR, f)),
+            reverse=True
+        )
+        for old in auto_files[_BACKUP_KEEP_COUNT:]:
+            try:
+                os.remove(os.path.join(BACKUPS_DIR, old))
+                logger.info("Auto-backup: pruned old backup %s", old)
+            except OSError:
+                pass
+    except Exception as e:
+        logger.warning("Auto-backup: prune failed: %s", e)
+
+def _auto_backup():
+    while True:
+        time.sleep(_BACKUP_INTERVAL_SECONDS)
+        try:
+            name, _path = create_backup('auto')
+            logger.info("Auto-backup created: %s", name)
+            _prune_old_auto_backups()
+        except Exception as e:
+            logger.exception("Auto-backup failed: %s", e)
+
+def _start_auto_backup_thread():
+    t = threading.Thread(target=_auto_backup, daemon=True, name='auto-backup')
+    t.start()
+    logger.info("Auto-backup thread started — interval %dh, keep last %d",
+                _BACKUP_INTERVAL_SECONDS // 3600, _BACKUP_KEEP_COUNT)
+
+_start_auto_backup_thread()
+
+
 # ── 7-day auto-trash cleanup ───────────────────────────────────────────────────
 TRASH_TTL_DAYS = int(os.environ.get('SCREENPLANT_TRASH_TTL_DAYS', '7'))
 _CLEANUP_INTERVAL_SECONDS = 24 * 60 * 60  # run once per day
@@ -5609,7 +5806,7 @@ def _auto_purge_old_trash():
     Background thread: runs daily.
     - Deletes photos from R2 (or local disk) for trash items older than TRASH_TTL_DAYS.
     - DB trash records are kept forever (free storage, useful for audit history).
-    - Marks items with 'photos_purged': True so we don't try to delete again.
+    - Marks items with 'photos_purged': True ONLY after confirmed success.
     """
     while True:
         try:
@@ -5624,8 +5821,11 @@ def _auto_purge_old_trash():
                             len(to_clean), TRASH_TTL_DAYS)
                 for item in to_clean:
                     purge_deleted_item_files(item)
-                    db_update_deleted_item(item)
-                logger.info("Auto-trash: photos cleaned, DB records kept")
+                    if item.get('photos_purged'):   # only update if purge actually set the flag
+                        db_update_deleted_item(item)
+                    else:
+                        logger.warning("Auto-trash: could not purge photos for %s, will retry next cycle", item.get('id'))
+                logger.info("Auto-trash: cycle complete")
         except Exception as e:
             logger.exception("Auto-trash cleanup failed: %s", e)
         time.sleep(_CLEANUP_INTERVAL_SECONDS)
