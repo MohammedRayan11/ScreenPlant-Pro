@@ -389,7 +389,7 @@ def _get_pg_pool():
     return _pg_pool
 
 def pg_conn():
-    """Return a PostgreSQL connection. Uses pool when psycopg_pool is available."""
+    """Legacy — use pg_connection() context manager for pooled connections."""
     pool = _get_pg_pool()
     if pool is not None:
         return pool.getconn()
@@ -412,6 +412,55 @@ def _release_pg_conn(conn):
             conn.close()
         except Exception:
             pass
+
+from contextlib import contextmanager as _contextmanager
+
+@_contextmanager
+def pg_connection():
+    """
+    Pool-safe context manager. Borrows a connection and RETURNS it (putconn)
+    when done — never destroys it. All PG DB helpers must use this.
+
+    Usage:
+        with pg_connection() as conn:
+            conn.execute(...)
+            conn.commit()
+    """
+    pool = _get_pg_pool()
+    if pool is not None:
+        conn = pool.getconn()
+        try:
+            yield conn
+        except Exception:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            raise
+        finally:
+            try:
+                pool.putconn(conn)
+            except Exception:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+    else:
+        psycopg, tuple_row, _ = pg_driver()
+        conn = psycopg.connect(DATABASE_URL, row_factory=tuple_row, connect_timeout=5)
+        try:
+            yield conn
+        except Exception:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            raise
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
 def load_sqlite_state():
     if not os.path.exists(SQLITE_FILE):
@@ -827,7 +876,7 @@ def init_db():
             db_initialized = True
             return
         _, _, Jsonb = pg_driver()
-        with closing(pg_conn()) as conn:
+        with pg_connection() as conn:
             pg_create_tables(conn)
             if not pg_has_relational_data(conn):
                 payload = pg_load_legacy_state(conn) or load_sqlite_state() or load_json_state() or ensure_db_shape(DEFAULT_DB.copy())
@@ -861,7 +910,7 @@ def load_db():
             save_db(db)
             return db
     try:
-        with closing(pg_conn()) as conn:
+        with pg_connection() as conn:
             return pg_load_relational_db(conn)
     except (Exception, json.JSONDecodeError) as e:
         logger.exception("PostgreSQL relational state is unavailable or corrupted; recovering from latest JSON backup: %s", e)
@@ -877,7 +926,7 @@ def save_db(db):
             conn.commit()
         return
     _, _, Jsonb = pg_driver()
-    with closing(pg_conn()) as conn:
+    with pg_connection() as conn:
         # Serialize whole-state saves while the existing route layer still edits
         # a reconstructed in-memory state object.
         conn.execute('SELECT pg_advisory_xact_lock(1)')
@@ -895,7 +944,7 @@ def db_get_school(school_id):
                 (school_id,)
             ).fetchone()
             return json.loads(row[0]) if row else None
-    with closing(pg_conn()) as conn:
+    with pg_connection() as conn:
         row = conn.execute(
             'SELECT data FROM screenplant_schools WHERE id = %s',
             (school_id,)
@@ -908,7 +957,7 @@ def db_get_settings():
         with closing(sqlite_conn()) as conn:
             row = conn.execute('SELECT data FROM screenplant_settings WHERE id = 1').fetchone()
             return json.loads(row[0]) if row else {}
-    with closing(pg_conn()) as conn:
+    with pg_connection() as conn:
         row = conn.execute('SELECT data FROM screenplant_settings WHERE id = 1').fetchone()
         return row[0] if row else {}
 
@@ -934,7 +983,7 @@ def db_list_schools(public_only=True):
             for school in schools:
                 school['submission_count'] = int(counts.get(school.get('id'), 0) or 0)
             return schools
-    with closing(pg_conn()) as conn:
+    with pg_connection() as conn:
         rows = conn.execute('SELECT data FROM screenplant_schools ORDER BY name, id').fetchall()
         schools = [row[0] for row in rows]
         if public_only:
@@ -953,7 +1002,7 @@ def db_get_submission(sub_id):
         with closing(sqlite_conn()) as conn:
             row = conn.execute('SELECT data FROM screenplant_submissions WHERE id = ?', (sub_id,)).fetchone()
             return json.loads(row[0]) if row else None
-    with closing(pg_conn()) as conn:
+    with pg_connection() as conn:
         row = conn.execute('SELECT data FROM screenplant_submissions WHERE id = %s', (sub_id,)).fetchone()
         return row[0] if row else None
 
@@ -981,7 +1030,7 @@ def db_update_submission(sub):
             conn.commit()
         return
     _, _, Jsonb = pg_driver()
-    with closing(pg_conn()) as conn:
+    with pg_connection() as conn:
         conn.execute(
             '''
             UPDATE screenplant_submissions
@@ -1002,7 +1051,7 @@ def db_list_templates():
     if not use_postgres():
         with closing(sqlite_conn()) as conn:
             return [json.loads(row[0]) for row in conn.execute('SELECT data FROM screenplant_templates ORDER BY created_at, id').fetchall()]
-    with closing(pg_conn()) as conn:
+    with pg_connection() as conn:
         return [row[0] for row in conn.execute('SELECT data FROM screenplant_templates ORDER BY created_at, id').fetchall()]
 
 def db_get_template_for_school(school_id):
@@ -1013,7 +1062,7 @@ def db_get_template_for_school(school_id):
         with closing(sqlite_conn()) as conn:
             row = conn.execute('SELECT data FROM screenplant_templates WHERE school_id = ? ORDER BY created_at DESC, id DESC LIMIT 1', (school_id,)).fetchone()
             return json.loads(row[0]) if row else {}
-    with closing(pg_conn()) as conn:
+    with pg_connection() as conn:
         row = conn.execute('SELECT data FROM screenplant_templates WHERE school_id = %s ORDER BY created_at DESC, id DESC LIMIT 1', (school_id,)).fetchone()
         return row[0] if row else {}
 
@@ -1022,7 +1071,7 @@ def db_list_orders():
     if not use_postgres():
         with closing(sqlite_conn()) as conn:
             return [json.loads(row[0]) for row in conn.execute('SELECT data FROM screenplant_orders ORDER BY order_date, id').fetchall()]
-    with closing(pg_conn()) as conn:
+    with pg_connection() as conn:
         return [row[0] for row in conn.execute('SELECT data FROM screenplant_orders ORDER BY order_date, id').fetchall()]
 
 # ── Surgical school helpers ────────────────────────────────────────────────────
@@ -1039,7 +1088,7 @@ def db_insert_school(school):
             conn.commit()
         return
     _, _, Jsonb = pg_driver()
-    with closing(pg_conn()) as conn:
+    with pg_connection() as conn:
         conn.execute(
             'INSERT INTO screenplant_schools (id, name, school_type, created_at, updated_at, data) VALUES (%s, %s, %s, %s, NOW()::TEXT, %s)',
             (school.get('id'), school.get('name', ''), school.get('type', ''), school.get('created_at', ''), Jsonb(school))
@@ -1058,7 +1107,7 @@ def db_update_school(school):
             conn.commit()
         return
     _, _, Jsonb = pg_driver()
-    with closing(pg_conn()) as conn:
+    with pg_connection() as conn:
         conn.execute(
             'UPDATE screenplant_schools SET name=%s, school_type=%s, updated_at=NOW()::TEXT, data=%s WHERE id=%s',
             (school.get('name', ''), school.get('type', ''), Jsonb(school), school.get('id'))
@@ -1072,7 +1121,7 @@ def db_delete_school(school_id):
             conn.execute('DELETE FROM screenplant_schools WHERE id = ?', (school_id,))
             conn.commit()
         return
-    with closing(pg_conn()) as conn:
+    with pg_connection() as conn:
         conn.execute('DELETE FROM screenplant_schools WHERE id = %s', (school_id,))
         conn.commit()
 
@@ -1086,7 +1135,7 @@ def db_delete_submissions_by_school(school_id):
             conn.execute('DELETE FROM screenplant_submissions WHERE school_id = ?', (school_id,))
             conn.commit()
         return deleted
-    with closing(pg_conn()) as conn:
+    with pg_connection() as conn:
         rows = conn.execute('SELECT data FROM screenplant_submissions WHERE school_id = %s', (school_id,)).fetchall()
         deleted = [r[0] for r in rows]
         conn.execute('DELETE FROM screenplant_submissions WHERE school_id = %s', (school_id,))
@@ -1103,7 +1152,7 @@ def db_delete_submission_by_id(sub_id):
             conn.execute('DELETE FROM screenplant_submissions WHERE id = ?', (sub_id,))
             conn.commit()
         return sub
-    with closing(pg_conn()) as conn:
+    with pg_connection() as conn:
         row = conn.execute('SELECT data FROM screenplant_submissions WHERE id = %s', (sub_id,)).fetchone()
         sub = row[0] if row else None
         conn.execute('DELETE FROM screenplant_submissions WHERE id = %s', (sub_id,))
@@ -1120,7 +1169,7 @@ def db_delete_all_submissions():
             conn.execute('DELETE FROM screenplant_submissions')
             conn.commit()
         return deleted
-    with closing(pg_conn()) as conn:
+    with pg_connection() as conn:
         rows = conn.execute('SELECT data FROM screenplant_submissions').fetchall()
         deleted = [r[0] for r in rows]
         conn.execute('DELETE FROM screenplant_submissions')
@@ -1141,7 +1190,7 @@ def db_insert_template(tpl):
             conn.commit()
         return
     _, _, Jsonb = pg_driver()
-    with closing(pg_conn()) as conn:
+    with pg_connection() as conn:
         conn.execute(
             'INSERT INTO screenplant_templates (id, school_id, name, file_path, created_at, updated_at, data) VALUES (%s, %s, %s, %s, %s, NOW()::TEXT, %s)',
             (tpl.get('id'), tpl.get('school_id', ''), tpl.get('name', ''), tpl.get('file', ''), tpl.get('created_at', ''), Jsonb(tpl))
@@ -1160,7 +1209,7 @@ def db_update_template(tpl):
             conn.commit()
         return
     _, _, Jsonb = pg_driver()
-    with closing(pg_conn()) as conn:
+    with pg_connection() as conn:
         conn.execute(
             'UPDATE screenplant_templates SET name=%s, school_id=%s, file_path=%s, updated_at=NOW()::TEXT, data=%s WHERE id=%s',
             (tpl.get('name', ''), tpl.get('school_id', ''), tpl.get('file', ''), Jsonb(tpl), tpl.get('id'))
@@ -1174,7 +1223,7 @@ def db_delete_template(tpl_id):
             conn.execute('DELETE FROM screenplant_templates WHERE id = ?', (tpl_id,))
             conn.commit()
         return
-    with closing(pg_conn()) as conn:
+    with pg_connection() as conn:
         conn.execute('DELETE FROM screenplant_templates WHERE id = %s', (tpl_id,))
         conn.commit()
 
@@ -1184,7 +1233,7 @@ def db_get_template(tpl_id):
         with closing(sqlite_conn()) as conn:
             row = conn.execute('SELECT data FROM screenplant_templates WHERE id = ?', (tpl_id,)).fetchone()
             return json.loads(row[0]) if row else None
-    with closing(pg_conn()) as conn:
+    with pg_connection() as conn:
         row = conn.execute('SELECT data FROM screenplant_templates WHERE id = %s', (tpl_id,)).fetchone()
         return row[0] if row else None
 
@@ -1207,7 +1256,7 @@ def db_insert_order(order):
             conn.commit()
         return
     _, _, Jsonb = pg_driver()
-    with closing(pg_conn()) as conn:
+    with pg_connection() as conn:
         conn.execute(
             'INSERT INTO screenplant_orders (id, school_id, status, order_date, total, updated_at, data) VALUES (%s, %s, %s, %s, %s, NOW()::TEXT, %s)',
             (order.get('id'), order.get('school_id', ''), order.get('status', ''), order.get('date', now), total, Jsonb(order))
@@ -1231,7 +1280,7 @@ def db_update_order(order):
             conn.commit()
         return
     _, _, Jsonb = pg_driver()
-    with closing(pg_conn()) as conn:
+    with pg_connection() as conn:
         conn.execute(
             'UPDATE screenplant_orders SET status=%s, total=%s, updated_at=NOW()::TEXT, data=%s WHERE id=%s',
             (order.get('status', ''), total, Jsonb(order), order.get('id'))
@@ -1245,7 +1294,7 @@ def db_delete_order(order_id):
             conn.execute('DELETE FROM screenplant_orders WHERE id = ?', (order_id,))
             conn.commit()
         return
-    with closing(pg_conn()) as conn:
+    with pg_connection() as conn:
         conn.execute('DELETE FROM screenplant_orders WHERE id = %s', (order_id,))
         conn.commit()
 
@@ -1255,7 +1304,7 @@ def db_get_order(order_id):
         with closing(sqlite_conn()) as conn:
             row = conn.execute('SELECT data FROM screenplant_orders WHERE id = ?', (order_id,)).fetchone()
             return json.loads(row[0]) if row else None
-    with closing(pg_conn()) as conn:
+    with pg_connection() as conn:
         row = conn.execute('SELECT data FROM screenplant_orders WHERE id = %s', (order_id,)).fetchone()
         return row[0] if row else None
 
@@ -1273,7 +1322,7 @@ def db_update_settings(settings_dict):
             conn.commit()
         return
     _, _, Jsonb = pg_driver()
-    with closing(pg_conn()) as conn:
+    with pg_connection() as conn:
         conn.execute(
             'INSERT INTO screenplant_settings (id, updated_at, data) VALUES (1, NOW()::TEXT, %s) ON CONFLICT(id) DO UPDATE SET updated_at=NOW()::TEXT, data=EXCLUDED.data',
             (Jsonb(settings_dict),)
@@ -1294,7 +1343,7 @@ def db_insert_deleted_item(item):
             conn.commit()
         return
     _, _, Jsonb = pg_driver()
-    with closing(pg_conn()) as conn:
+    with pg_connection() as conn:
         conn.execute(
             'INSERT INTO screenplant_deleted_items (id, item_type, item_id, deleted_at, updated_at, data) VALUES (%s, %s, %s, %s, NOW()::TEXT, %s)',
             (item.get('id'), item.get('type', ''), item.get('item_id', ''), item.get('deleted_at', ''), Jsonb(item))
@@ -1314,7 +1363,7 @@ def db_update_deleted_item(item):
             conn.commit()
         return
     _, _, Jsonb = pg_driver()
-    with closing(pg_conn()) as conn:
+    with pg_connection() as conn:
         conn.execute(
             'UPDATE screenplant_deleted_items SET updated_at=NOW()::TEXT, data=%s WHERE id=%s',
             (Jsonb(item), item.get('id'))
@@ -1327,7 +1376,7 @@ def db_get_deleted_item(deleted_id):
         with closing(sqlite_conn()) as conn:
             row = conn.execute('SELECT data FROM screenplant_deleted_items WHERE id = ?', (deleted_id,)).fetchone()
             return json.loads(row[0]) if row else None
-    with closing(pg_conn()) as conn:
+    with pg_connection() as conn:
         row = conn.execute('SELECT data FROM screenplant_deleted_items WHERE id = %s', (deleted_id,)).fetchone()
         return row[0] if row else None
 
@@ -1343,7 +1392,7 @@ def db_list_deleted_items():
     if not use_postgres():
         with closing(sqlite_conn()) as conn:
             return [json.loads(r[0]) for r in conn.execute('SELECT data FROM screenplant_deleted_items ORDER BY deleted_at DESC, id DESC').fetchall()]
-    with closing(pg_conn()) as conn:
+    with pg_connection() as conn:
         return [r[0] for r in conn.execute('SELECT data FROM screenplant_deleted_items ORDER BY deleted_at DESC, id DESC').fetchall()]
 
 def db_restore_submission_from_deleted(item):
@@ -1391,7 +1440,7 @@ def db_insert_submission(sub):
             conn.commit()
         return
     _, _, Jsonb = pg_driver()
-    with closing(pg_conn()) as conn:
+    with pg_connection() as conn:
         conn.execute(
             '''
             INSERT INTO screenplant_submissions
@@ -1420,7 +1469,7 @@ def db_count_submissions_by_identity(school_id, identity_hash):
                 ''',
                 (school_id, identity_hash)
             ).fetchone()[0]
-    with closing(pg_conn()) as conn:
+    with pg_connection() as conn:
         return conn.execute(
             '''
             SELECT COUNT(*) FROM screenplant_submissions
@@ -1455,7 +1504,7 @@ def db_list_submissions(school_id='', status='', page=None, per_page=50):
             return [json.loads(row[0]) for row in rows]
     pg_where_sql = where_sql.replace('?', '%s')
     pg_limit_sql = limit_sql.replace('?', '%s')
-    with closing(pg_conn()) as conn:
+    with pg_connection() as conn:
         rows = conn.execute(
             f'SELECT data FROM screenplant_submissions{pg_where_sql} ORDER BY submitted_at DESC, id DESC{pg_limit_sql}',
             tuple(params)
@@ -1478,7 +1527,7 @@ def db_list_submissions_for_generation(school_id='', sub_ids=None):
                 loaded = [json.loads(row[0]) for row in rows]
                 by_id = {sub.get('id'): sub for sub in loaded}
         else:
-            with closing(pg_conn()) as conn:
+            with pg_connection() as conn:
                 rows = conn.execute(
                     'SELECT data FROM screenplant_submissions WHERE id = ANY(%s)',
                     (ids,)
@@ -1509,7 +1558,7 @@ def db_mark_submissions_generated(subs):
             conn.commit()
         return
     _, _, Jsonb = pg_driver()
-    with closing(pg_conn()) as conn:
+    with pg_connection() as conn:
         with conn.cursor() as cur:
             cur.executemany(
                 '''
@@ -1538,7 +1587,7 @@ def db_count_submissions(school_id='', status=''):
                 f'SELECT COUNT(*) FROM screenplant_submissions{where_sql}',
                 tuple(params)
             ).fetchone()[0]
-    with closing(pg_conn()) as conn:
+    with pg_connection() as conn:
         return conn.execute(
             f"SELECT COUNT(*) FROM screenplant_submissions{where_sql.replace('?', '%s')}",
             tuple(params)
@@ -1562,7 +1611,7 @@ def db_school_submission_stats(school_id):
                 (school_id,)
             ).fetchone()
     else:
-        with closing(pg_conn()) as conn:
+        with pg_connection() as conn:
             row = conn.execute(
                 '''
                 SELECT
@@ -1637,7 +1686,7 @@ def db_stats_payload():
                 '''
             ).fetchall()
     else:
-        with closing(pg_conn()) as conn:
+        with pg_connection() as conn:
             schools_count = conn.execute('SELECT COUNT(*) FROM screenplant_schools').fetchone()[0]
             templates_count = conn.execute('SELECT COUNT(*) FROM screenplant_templates').fetchone()[0]
             row = conn.execute(
@@ -1729,7 +1778,7 @@ def db_analytics_daily_counts(days):
                 (start_key,)
             ).fetchall()
     else:
-        with closing(pg_conn()) as conn:
+        with pg_connection() as conn:
             rows = conn.execute(
                 '''
                 SELECT substring(submitted_at from 1 for 10) AS day, COUNT(*)
@@ -1766,7 +1815,7 @@ def db_analytics_by_school_rows():
                 '''
             ).fetchall()
     else:
-        with closing(pg_conn()) as conn:
+        with pg_connection() as conn:
             rows = conn.execute(
                 '''
                 SELECT
@@ -1826,7 +1875,7 @@ def db_analytics_csv_rows(days):
                 ''',
                 (start_key,)
             ).fetchall()
-    with closing(pg_conn()) as conn:
+    with pg_connection() as conn:
         return conn.execute(
             '''
             SELECT
@@ -2560,7 +2609,7 @@ def health_check():
     db_backend = 'postgres' if use_postgres() else 'sqlite'
     try:
         if use_postgres():
-            with closing(pg_conn()) as conn:
+            with pg_connection() as conn:
                 conn.execute('SELECT 1').fetchone()
         else:
             with closing(sqlite_conn()) as conn:
