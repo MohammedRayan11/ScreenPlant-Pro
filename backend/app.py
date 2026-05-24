@@ -2583,17 +2583,36 @@ def after_request_hardening(response):
     if not request.path.startswith('/uploads/'):  # skip noisy photo fetches
         logger.info('REQUEST method=%s path=%s status=%d duration_ms=%d ip=%s',
                     request.method, request.path, response.status_code, duration_ms, client_ip)
+
+    # ── Security headers ──────────────────────────────────────────────────────
     response.headers['X-Content-Type-Options'] = 'nosniff'
     response.headers['X-Frame-Options'] = 'SAMEORIGIN'
     response.headers['Referrer-Policy'] = 'strict-origin-when-cross-origin'
     response.headers['X-XSS-Protection'] = '1; mode=block'
-    # Content-Security-Policy: restrict scripts to self + Google Fonts CDN
+
+    # HSTS: tell browsers to always use HTTPS (only sent over HTTPS)
+    if _is_https:
+        response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
+
+    # Permissions-Policy: disable unused browser APIs (camera, mic, geolocation)
+    response.headers['Permissions-Policy'] = (
+        'camera=(), microphone=(), geolocation=(), payment=()'
+    )
+
+    # Cache-Control: API responses must not be cached by proxies or browsers
+    if request.path.startswith('/api/'):
+        response.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate, private'
+        response.headers['Pragma'] = 'no-cache'
+
+    # Content-Security-Policy
+    # img-src includes R2 public URL when configured, for direct photo delivery
+    r2_img_src = f' {_R2_PUBLIC_URL}' if (_USE_R2 and _R2_PUBLIC_URL) else ''
     response.headers['Content-Security-Policy'] = (
         "default-src 'self'; "
         "script-src 'self' 'unsafe-inline'; "
         "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
         "font-src 'self' https://fonts.gstatic.com; "
-        "img-src 'self' data: blob:; "
+        f"img-src 'self' data: blob:{r2_img_src}; "
         "connect-src 'self'; "
         "frame-ancestors 'self';"
     )
@@ -3326,7 +3345,22 @@ def submit_form():
             return jsonify({"error": str(e)}), 400
         try:
             photo_path = unique_upload_path(photo_label, ext)
-            photo_file.save(photo_path)
+            # Re-save through Pillow to strip EXIF metadata (GPS, device info) and
+            # auto-correct orientation before storage. Raw save would preserve PII.
+            try:
+                from PIL import ImageOps
+                img_raw = Image.open(photo_file.stream)
+                img_raw = ImageOps.exif_transpose(img_raw)  # fix rotation from EXIF
+                img_save = img_raw.convert('RGB')
+                save_ext = ext.lower().lstrip('.')
+                fmt = 'JPEG' if save_ext in ('jpg', 'jpeg') else save_ext.upper()
+                if fmt not in ('JPEG', 'PNG', 'WEBP'):
+                    fmt = 'JPEG'
+                img_save.save(photo_path, format=fmt, quality=88, optimize=True)
+            except Exception:
+                # Pillow re-save failed — fall back to raw save (still validated above)
+                photo_file.stream.seek(0)
+                photo_file.save(photo_path)
             if _USE_R2:
                 mime_map = {'.jpg': 'image/jpeg', '.jpeg': 'image/jpeg',
                             '.png': 'image/png', '.webp': 'image/webp'}
@@ -5863,8 +5897,39 @@ def _start_auto_trash_thread():
     t.start()
     logger.info("Auto-trash cleanup started — items purged after %d days", TRASH_TTL_DAYS)
 
+def _start_rate_bucket_pruner():
+    """
+    Background thread: prune stale entries from rate_bucket and login_failures
+    every hour to prevent unbounded memory growth on long-running instances.
+    rate_bucket entries are already self-expiring per-request, but old IP keys
+    accumulate indefinitely if never touched again.
+    """
+    def _prune():
+        while True:
+            try:
+                time.sleep(3600)  # run every hour
+                cutoff = time.time() - 3600  # remove buckets idle for >1 hour
+                keys_to_del = [k for k, v in list(rate_bucket.items()) if all(t < cutoff for t in v)]
+                for k in keys_to_del:
+                    rate_bucket.pop(k, None)
+                # Prune expired login lockouts
+                expired_ips = [
+                    ip for ip, entry in list(login_failures.items())
+                    if entry.get('locked_until', 0) < time.time() and entry.get('count', 0) < _LOGIN_MAX_FAILURES
+                ]
+                for ip in expired_ips:
+                    login_failures.pop(ip, None)
+                if keys_to_del or expired_ips:
+                    logger.debug("Rate-bucket pruner: removed %d stale keys, %d expired lockouts",
+                                 len(keys_to_del), len(expired_ips))
+            except Exception:
+                pass
+    t = threading.Thread(target=_prune, daemon=True, name='rate-bucket-pruner')
+    t.start()
+
 # Start the cleanup thread when the app loads (works on Railway, Render, gunicorn, etc.)
 _start_auto_trash_thread()
+_start_rate_bucket_pruner()
 
 
 if __name__ == '__main__':
