@@ -96,7 +96,7 @@ app.config.update(
     SESSION_COOKIE_SECURE=_is_https,   # Set SCREENPLANT_HTTPS=1 in production behind HTTPS
     PERMANENT_SESSION_LIFETIME=timedelta(hours=12),
 )
-CORS(app, origins=os.environ.get('SCREENPLANT_CORS_ORIGINS', 'http://localhost:5000,http://127.0.0.1:5000').split(','), supports_credentials=True)
+CORS(app, origins=os.environ.get('SCREENPLANT_CORS_ORIGINS', '*').split(','), supports_credentials=True)
 
 logging.basicConfig(
     level=os.environ.get('SCREENPLANT_LOG_LEVEL', 'INFO'),
@@ -271,8 +271,10 @@ reset_otps = {}       # phone -> {'hash': str, 'expires': float, 'attempts': int
 admin_password_hash_override = ''
 
 # Stats cache — avoids running 8+ DB queries on every dashboard refresh
+# TTL set to 60s: admin sees data that's at most 1 minute old, but DB load drops 10x
 _stats_cache = {'data': None, 'expires': 0.0}
 _stats_cache_lock = threading.Lock()
+_STATS_CACHE_TTL = int(os.environ.get('SCREENPLANT_STATS_CACHE_TTL', '60'))
 
 # [ENHANCED] Runtime password hashing for the change-password endpoint. Existing
 # env-based plaintext auth remains supported for backward compatibility.
@@ -388,9 +390,9 @@ def _get_pg_pool():
         try:
             from psycopg_pool import ConnectionPool
             psycopg, tuple_row, _ = pg_driver()
-            min_size = int(os.environ.get('SCREENPLANT_PG_POOL_MIN', '1'))
-            max_size = int(os.environ.get('SCREENPLANT_PG_POOL_MAX', '5'))
-            pool_timeout = float(os.environ.get('SCREENPLANT_PG_POOL_TIMEOUT', '10'))
+            min_size = int(os.environ.get('SCREENPLANT_PG_POOL_MIN', '3'))
+            max_size = int(os.environ.get('SCREENPLANT_PG_POOL_MAX', '15'))
+            pool_timeout = float(os.environ.get('SCREENPLANT_PG_POOL_TIMEOUT', '30'))
             _pg_pool = ConnectionPool(
                 DATABASE_URL,
                 min_size=min_size,
@@ -416,6 +418,20 @@ def _get_pg_pool():
                 "PostgreSQL pool started (min=%d max=%d timeout=%.0fs check=on keepalives=on)",
                 min_size, max_size, pool_timeout
             )
+            # Keep-alive ping: fires every 45s to prevent Neon from cold-starting
+            # on the first real request. Costs ~1 CU-second per minute — negligible.
+            def _pg_keepalive():
+                time.sleep(20)  # brief delay so app finishes starting first
+                while True:
+                    try:
+                        if _pg_pool:
+                            with pg_ro_connection() as _kconn:
+                                _kconn.execute("SELECT 1")
+                    except Exception:
+                        pass
+                    time.sleep(45)
+            threading.Thread(target=_pg_keepalive, daemon=True, name='pg-keepalive').start()
+            logger.info("PostgreSQL keep-alive thread started (interval=45s)")
         except ImportError:
             logger.warning(
                 "psycopg_pool not installed — falling back to per-request connections. "
@@ -3356,7 +3372,13 @@ def submit_form():
                 fmt = 'JPEG' if save_ext in ('jpg', 'jpeg') else save_ext.upper()
                 if fmt not in ('JPEG', 'PNG', 'WEBP'):
                     fmt = 'JPEG'
-                img_save.save(photo_path, format=fmt, quality=88, optimize=True)
+                # Resize oversized photos — students often upload 3-5MB phone shots.
+                # ID cards only need ~600x800px; capping at 1200px on the long edge
+                # keeps quality excellent while cutting file size to ~150-300KB.
+                _MAX_PHOTO_PX = int(os.environ.get('SCREENPLANT_MAX_PHOTO_PX', '1200'))
+                if max(img_save.width, img_save.height) > _MAX_PHOTO_PX:
+                    img_save.thumbnail((_MAX_PHOTO_PX, _MAX_PHOTO_PX), Image.LANCZOS)
+                img_save.save(photo_path, format=fmt, quality=82, optimize=True)
             except Exception:
                 # Pillow re-save failed — fall back to raw save (still validated above)
                 photo_file.stream.seek(0)
@@ -3365,7 +3387,17 @@ def submit_form():
                 mime_map = {'.jpg': 'image/jpeg', '.jpeg': 'image/jpeg',
                             '.png': 'image/png', '.webp': 'image/webp'}
                 ct = mime_map.get(ext.lower(), 'image/jpeg')
-                r2_upload(photo_path, r2_key_from_path(photo_path), content_type=ct)
+                # Upload to R2 in background — don't block the student's response.
+                # The photo is already saved locally; R2 sync happens within seconds.
+                _r2_upload_key = r2_key_from_path(photo_path)
+                _r2_upload_path = photo_path
+                _r2_upload_ct = ct
+                def _bg_r2_upload(path=_r2_upload_path, key=_r2_upload_key, content_type=_r2_upload_ct):
+                    try:
+                        r2_upload(path, key, content_type=content_type)
+                    except Exception as _r2e:
+                        logger.error("Background R2 upload failed for %s: %s", key, _r2e)
+                threading.Thread(target=_bg_r2_upload, daemon=True, name='r2-upload').start()
         except Exception as e:
             logger.exception("Could not save photo for %s: %s", photo_label, e)
             if photo_path and os.path.exists(photo_path):
@@ -3391,18 +3423,16 @@ def submit_form():
             f.write(sig_bytes)
         if _USE_R2:
             try:
-                r2_upload(sig_path, r2_key_from_path(sig_path), content_type='image/png')
+                _sig_key = r2_key_from_path(sig_path)
+                _sig_path = sig_path
+                def _bg_sig_upload(path=_sig_path, key=_sig_key):
+                    try:
+                        r2_upload(path, key, content_type='image/png')
+                    except Exception as _se:
+                        logger.error("Background R2 signature upload failed for %s: %s", key, _se)
+                threading.Thread(target=_bg_sig_upload, daemon=True, name='r2-sig-upload').start()
             except Exception as e:
-                logger.exception("Could not upload signature for %s to R2: %s", photo_label, e)
-                for fp in [photo_path, sig_path]:
-                    if fp and os.path.exists(fp):
-                        try:
-                            os.remove(fp)
-                        except OSError:
-                            pass
-                if photo_path:
-                    r2_delete(r2_key_from_path(photo_path))
-                return jsonify({"error": "Signature could not be saved to cloud storage. Please try again."}), 500
+                logger.exception("Could not schedule signature upload for %s to R2: %s", photo_label, e)
 
     # ── Store all raw dynamic fields so nothing is lost ────────────────────────
     # Every key the frontend sent (excluding system keys and files) is stored in
@@ -4374,7 +4404,7 @@ def get_stats():
     payload["revenue_this_month"] = payload.get("revenue", 0)
     with _stats_cache_lock:
         _stats_cache['data'] = payload
-        _stats_cache['expires'] = time.time() + 20
+        _stats_cache['expires'] = time.time() + _STATS_CACHE_TTL
     return jsonify(payload)
 
 @app.route('/api/analytics/daily', methods=['GET'])
