@@ -271,10 +271,15 @@ reset_otps = {}       # phone -> {'hash': str, 'expires': float, 'attempts': int
 admin_password_hash_override = ''
 
 # Stats cache — avoids running 8+ DB queries on every dashboard refresh
-# TTL set to 60s: admin sees data that's at most 1 minute old, but DB load drops 10x
+# TTL set to 30s by default; admin sees data at most 30s old, DB load drops 10x+
 _stats_cache = {'data': None, 'expires': 0.0}
 _stats_cache_lock = threading.Lock()
-_STATS_CACHE_TTL = int(os.environ.get('SCREENPLANT_STATS_CACHE_TTL', '60'))
+_STATS_CACHE_TTL = int(os.environ.get('SCREENPLANT_STATS_CACHE_TTL', '30'))
+
+# Analytics daily cache — these counts change slowly; 60s TTL is fine
+_analytics_daily_cache = {}           # key: days -> {'data': ..., 'expires': float}
+_analytics_daily_cache_lock = threading.Lock()
+_ANALYTICS_CACHE_TTL = int(os.environ.get('SCREENPLANT_ANALYTICS_CACHE_TTL', '60'))
 
 # [ENHANCED] Runtime password hashing for the change-password endpoint. Existing
 # env-based plaintext auth remains supported for backward compatibility.
@@ -391,8 +396,8 @@ def _get_pg_pool():
             from psycopg_pool import ConnectionPool
             psycopg, tuple_row, _ = pg_driver()
             min_size = int(os.environ.get('SCREENPLANT_PG_POOL_MIN', '3'))
-            max_size = int(os.environ.get('SCREENPLANT_PG_POOL_MAX', '15'))
-            pool_timeout = float(os.environ.get('SCREENPLANT_PG_POOL_TIMEOUT', '30'))
+            max_size = int(os.environ.get('SCREENPLANT_PG_POOL_MAX', '25'))
+            pool_timeout = float(os.environ.get('SCREENPLANT_PG_POOL_TIMEOUT', '10'))
             _pg_pool = ConnectionPool(
                 DATABASE_URL,
                 min_size=min_size,
@@ -418,20 +423,22 @@ def _get_pg_pool():
                 "PostgreSQL pool started (min=%d max=%d timeout=%.0fs check=on keepalives=on)",
                 min_size, max_size, pool_timeout
             )
-            # Keep-alive ping: fires every 45s to prevent Neon from cold-starting
-            # on the first real request. Costs ~1 CU-second per minute — negligible.
+            # Keep-alive ping: fires every 45s to prevent Neon from cold-starting.
+            # Uses a direct connection instead of the pool so it never occupies
+            # a pool slot and cannot contribute to pool exhaustion.
+            _keepalive_db_url = DATABASE_URL
             def _pg_keepalive():
                 time.sleep(20)  # brief delay so app finishes starting first
                 while True:
                     try:
-                        if _pg_pool:
-                            with pg_ro_connection() as _kconn:
-                                _kconn.execute("SELECT 1")
+                        import psycopg as _psycopg_ka
+                        with _psycopg_ka.connect(_keepalive_db_url, connect_timeout=5) as _kconn:
+                            _kconn.execute("SELECT 1")
                     except Exception:
                         pass
                     time.sleep(45)
             threading.Thread(target=_pg_keepalive, daemon=True, name='pg-keepalive').start()
-            logger.info("PostgreSQL keep-alive thread started (interval=45s)")
+            logger.info("PostgreSQL keep-alive thread started (interval=45s, direct connection)")
         except ImportError:
             logger.warning(
                 "psycopg_pool not installed — falling back to per-request connections. "
@@ -4410,9 +4417,17 @@ def get_stats():
 @app.route('/api/analytics/daily', methods=['GET'])
 @admin_required
 def analytics_daily():
-    # [NEW] Submission trend for the last N days.
+    # Submission trend for the last N days — cached to avoid repeated DB hits.
     days = parse_int(request.args.get('days'), 30, 1, 365)
-    return jsonify(db_analytics_daily_counts(days))
+    now = time.time()
+    with _analytics_daily_cache_lock:
+        cached = _analytics_daily_cache.get(days)
+        if cached and now < cached['expires']:
+            return jsonify(cached['data'])
+    data = db_analytics_daily_counts(days)
+    with _analytics_daily_cache_lock:
+        _analytics_daily_cache[days] = {'data': data, 'expires': time.time() + _ANALYTICS_CACHE_TTL}
+    return jsonify(data)
 
 @app.route('/api/analytics/by-school', methods=['GET'])
 @admin_required
@@ -5883,14 +5898,24 @@ def _prune_old_auto_backups():
         logger.warning("Auto-backup: prune failed: %s", e)
 
 def _auto_backup():
+    # Stagger startup by 60s so this doesn't race with trash-cleanup at boot
+    time.sleep(60)
     while True:
+        # Retry up to 3 times with 15s gaps on pool timeout — handles cold starts
+        for attempt in range(3):
+            try:
+                name, _path = create_backup('auto')
+                logger.info("Auto-backup created: %s", name)
+                _prune_old_auto_backups()
+                break
+            except Exception as e:
+                if attempt < 2 and 'PoolTimeout' in type(e).__name__:
+                    logger.warning("Auto-backup pool timeout (attempt %d/3), retrying in 15s", attempt + 1)
+                    time.sleep(15)
+                else:
+                    logger.exception("Auto-backup failed: %s", e)
+                    break
         time.sleep(_BACKUP_INTERVAL_SECONDS)
-        try:
-            name, _path = create_backup('auto')
-            logger.info("Auto-backup created: %s", name)
-            _prune_old_auto_backups()
-        except Exception as e:
-            logger.exception("Auto-backup failed: %s", e)
 
 def _start_auto_backup_thread():
     t = threading.Thread(target=_auto_backup, daemon=True, name='auto-backup')
@@ -5912,6 +5937,8 @@ def _auto_purge_old_trash():
     - DB trash records are kept forever (free storage, useful for audit history).
     - Marks items with 'photos_purged': True ONLY after confirmed success.
     """
+    # Stagger startup by 120s so backup thread runs first and pool is warm
+    time.sleep(120)
     while True:
         try:
             cutoff = (datetime.now() - timedelta(days=TRASH_TTL_DAYS)).isoformat()
