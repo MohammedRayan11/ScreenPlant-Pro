@@ -3380,12 +3380,26 @@ def submit_form():
                 if fmt not in ('JPEG', 'PNG', 'WEBP'):
                     fmt = 'JPEG'
                 # Resize oversized photos — students often upload 3-5MB phone shots.
-                # ID cards only need ~600x800px; capping at 1200px on the long edge
-                # keeps quality excellent while cutting file size to ~150-300KB.
+                # Compression strategy:
+                # - Photos under 1MB: save at high quality (95), no resize — preserve original quality
+                # - Photos over 1MB: resize to 1200px max and compress to quality 82
+                # - Photos under 400px (genuinely low-res): always save at quality 95
                 _MAX_PHOTO_PX = int(os.environ.get('SCREENPLANT_MAX_PHOTO_PX', '1200'))
-                if max(img_save.width, img_save.height) > _MAX_PHOTO_PX:
-                    img_save.thumbnail((_MAX_PHOTO_PX, _MAX_PHOTO_PX), Image.LANCZOS)
-                img_save.save(photo_path, format=fmt, quality=82, optimize=True)
+                _COMPRESS_THRESHOLD_BYTES = int(os.environ.get('SCREENPLANT_COMPRESS_THRESHOLD_BYTES', str(1 * 1024 * 1024)))  # 1MB default
+                # Get original file size
+                photo_file.stream.seek(0, 2)  # seek to end
+                original_size_bytes = photo_file.stream.tell()
+                photo_file.stream.seek(0)  # reset
+                is_small_res = max(img_save.width, img_save.height) < 400
+                needs_compression = original_size_bytes > _COMPRESS_THRESHOLD_BYTES
+                if needs_compression and not is_small_res:
+                    # Large photo — resize and compress
+                    if max(img_save.width, img_save.height) > _MAX_PHOTO_PX:
+                        img_save.thumbnail((_MAX_PHOTO_PX, _MAX_PHOTO_PX), Image.LANCZOS)
+                    img_save.save(photo_path, format=fmt, quality=82, optimize=True)
+                else:
+                    # Small photo or low-res — preserve quality, no resize
+                    img_save.save(photo_path, format=fmt, quality=95, optimize=True)
             except Exception:
                 # Pillow re-save failed — fall back to raw save (still validated above)
                 photo_file.stream.seek(0)
