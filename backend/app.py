@@ -404,21 +404,30 @@ def _get_pg_pool():
                 max_size=max_size,
                 timeout=pool_timeout,
                 # check= validates every connection before use.
-                # Dead Neon connections are caught here and replaced transparently.
+                # Dead connections are caught here and replaced transparently.
                 check=_pg_pool_check,
                 # reconnect_timeout: max time to keep retrying a dead connection.
                 reconnect_timeout=30,
+                # wait=False: pool opens without blocking startup.
+                # Connections are established in background threads immediately.
+                # This prevents the first request from waiting for pool warmup.
+                open=True,
+                wait=False,
                 kwargs={
+                    # connect_timeout=5: faster failure if DB is unreachable.
+                    # Railway PostgreSQL is always on so 5s is plenty.
+                    'connect_timeout': 5,
                     'row_factory': tuple_row,
-                    'connect_timeout': 10,
-                    # TCP keepalives prevent Neon from silently killing idle connections.
+                    # TCP keepalives prevent silent connection drops on idle pools.
                     'keepalives': 1,
                     'keepalives_idle': 30,
                     'keepalives_interval': 5,
                     'keepalives_count': 5,
                 },
-                open=True,
             )
+            # Warm up the pool immediately — ensures min_size connections are
+            # ready before the first real request hits, preventing 10s warmup delay.
+            _pg_pool.check()
             logger.info(
                 "PostgreSQL pool started (min=%d max=%d timeout=%.0fs check=on keepalives=on)",
                 min_size, max_size, pool_timeout
@@ -6022,5 +6031,3 @@ if __name__ == '__main__':
     print("  Admin: http://localhost:5000")
     print("="*50 + "\n")
     app.run(debug=os.environ.get('FLASK_DEBUG') == '1', port=parse_int(os.environ.get('PORT'), 5000, 1, 65535), use_reloader=False)
-
-
