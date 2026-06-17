@@ -408,11 +408,8 @@ def _get_pg_pool():
                 check=_pg_pool_check,
                 # reconnect_timeout: max time to keep retrying a dead connection.
                 reconnect_timeout=30,
-                # wait=False: pool opens without blocking startup.
-                # Connections are established in background threads immediately.
-                # This prevents the first request from waiting for pool warmup.
+                # open=True: start pool immediately on startup.
                 open=True,
-                wait=False,
                 kwargs={
                     # connect_timeout=5: faster failure if DB is unreachable.
                     # Railway PostgreSQL is always on so 5s is plenty.
