@@ -153,12 +153,14 @@ def _get_r2_client():
         raise RuntimeError(
             "R2 credentials not set. Set R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY."
         )
+    from botocore.config import Config as _BotoConfig
     _r2_client = boto3.client(
         's3',
         endpoint_url=f'https://{_R2_ACCOUNT_ID}.r2.cloudflarestorage.com',
         aws_access_key_id=_R2_ACCESS_KEY_ID,
         aws_secret_access_key=_R2_SECRET_ACCESS_KEY,
         region_name='auto',
+        config=_BotoConfig(max_pool_connections=50),
     )
     return _r2_client
 
@@ -281,6 +283,21 @@ _analytics_daily_cache = {}           # key: days -> {'data': ..., 'expires': fl
 _analytics_daily_cache_lock = threading.Lock()
 _ANALYTICS_CACHE_TTL = int(os.environ.get('SCREENPLANT_ANALYTICS_CACHE_TTL', '60'))
 
+# Orders cache — orders don't change frequently; 30s TTL
+_orders_cache = {'data': None, 'expires': 0.0}
+_orders_cache_lock = threading.Lock()
+_ORDERS_CACHE_TTL = 30
+
+# Templates cache — templates rarely change; 60s TTL
+_templates_cache = {'data': None, 'expires': 0.0}
+_templates_cache_lock = threading.Lock()
+_TEMPLATES_CACHE_TTL = 60
+
+# Schools cache — schools rarely change; 60s TTL
+_schools_cache = {'data': None, 'expires': 0.0}
+_schools_cache_lock = threading.Lock()
+_SCHOOLS_CACHE_TTL = 60
+
 # [ENHANCED] Runtime password hashing for the change-password endpoint. Existing
 # env-based plaintext auth remains supported for backward compatibility.
 def password_hash(raw):
@@ -395,8 +412,8 @@ def _get_pg_pool():
         try:
             from psycopg_pool import ConnectionPool
             psycopg, tuple_row, _ = pg_driver()
-            min_size = int(os.environ.get('SCREENPLANT_PG_POOL_MIN', '3'))
-            max_size = int(os.environ.get('SCREENPLANT_PG_POOL_MAX', '25'))
+            min_size = int(os.environ.get('SCREENPLANT_PG_POOL_MIN', '5'))
+            max_size = int(os.environ.get('SCREENPLANT_PG_POOL_MAX', '40'))
             pool_timeout = float(os.environ.get('SCREENPLANT_PG_POOL_TIMEOUT', '10'))
             _pg_pool = ConnectionPool(
                 DATABASE_URL,
@@ -3034,7 +3051,15 @@ def delete_school_submissions(school_id):
 @app.route('/api/templates', methods=['GET'])
 @admin_required
 def get_templates():
-    return jsonify(db_list_templates())
+    now = time.time()
+    with _templates_cache_lock:
+        if _templates_cache['data'] is not None and now < _templates_cache['expires']:
+            return jsonify(_templates_cache['data'])
+    data = db_list_templates()
+    with _templates_cache_lock:
+        _templates_cache['data'] = data
+        _templates_cache['expires'] = time.time() + _TEMPLATES_CACHE_TTL
+    return jsonify(data)
 
 @app.route('/api/templates', methods=['POST'])
 @admin_required
@@ -3092,6 +3117,8 @@ def delete_template(tpl_id):
     if tpl and tpl.get('file') and os.path.exists(tpl['file']):
         os.remove(tpl['file'])
     db_delete_template(tpl_id)
+    with _templates_cache_lock:
+        _templates_cache['data'] = None
     return jsonify({"ok": True})
 
 @app.route('/api/templates/<tpl_id>/duplicate', methods=['POST'])
@@ -3144,6 +3171,8 @@ def update_template(tpl_id):
         file.save(file_path)
         tpl['file'] = file_path
     db_update_template(tpl)
+    with _templates_cache_lock:
+        _templates_cache['data'] = None
     return jsonify(tpl)
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -3567,13 +3596,32 @@ def delete_submission(sub_id):
 @app.route('/api/submissions/<sub_id>/status', methods=['PATCH'])
 @admin_required
 def update_status(sub_id):
+    # Optimised: fetch + update in a single DB connection instead of two.
+    data = request.json or {}
+    status = data.get('status', '')
+    if status not in ALLOWED_SUBMISSION_STATUSES:
+        return jsonify({"error": "Invalid status"}), 400
+    if use_postgres():
+        _, _, Jsonb = pg_driver()
+        with pg_connection() as conn:
+            row = conn.execute(
+                'SELECT data FROM screenplant_submissions WHERE id = %s', (sub_id,)
+            ).fetchone()
+            if not row:
+                return jsonify({"error": "Not found"}), 404
+            sub = row[0]
+            sub['status'] = status
+            conn.execute(
+                '''UPDATE screenplant_submissions
+                   SET status = %s, updated_at = NOW()::TEXT, data = %s
+                   WHERE id = %s''',
+                (status, Jsonb(sub), sub_id)
+            )
+            conn.commit()
+        return jsonify(sub)
     sub = db_get_submission(sub_id)
     if not sub:
         return jsonify({"error": "Not found"}), 404
-    data = request.json or {}
-    status = data.get('status', sub['status'])
-    if status not in ALLOWED_SUBMISSION_STATUSES:
-        return jsonify({"error": "Invalid status"}), 400
     sub['status'] = status
     db_update_submission(sub)
     return jsonify(sub)
@@ -4375,7 +4423,15 @@ def export_csv():
 @app.route('/api/orders', methods=['GET'])
 @admin_required
 def get_orders():
-    return jsonify(db_list_orders())
+    now = time.time()
+    with _orders_cache_lock:
+        if _orders_cache['data'] is not None and now < _orders_cache['expires']:
+            return jsonify(_orders_cache['data'])
+    data = db_list_orders()
+    with _orders_cache_lock:
+        _orders_cache['data'] = data
+        _orders_cache['expires'] = time.time() + _ORDERS_CACHE_TTL
+    return jsonify(data)
 
 @app.route('/api/orders', methods=['POST'])
 @admin_required
@@ -4401,6 +4457,8 @@ def add_order():
 @app.route('/api/orders/<order_id>', methods=['PATCH'])
 @admin_required
 def update_order(order_id):
+    with _orders_cache_lock:
+        _orders_cache['data'] = None
     order = db_get_order(order_id)
     if not order:
         return jsonify({"error": "Not found"}), 404
@@ -4414,6 +4472,8 @@ def update_order(order_id):
 @app.route('/api/orders/<order_id>', methods=['DELETE'])
 @admin_required
 def delete_order(order_id):
+    with _orders_cache_lock:
+        _orders_cache['data'] = None
     order = db_get_order(order_id)
     if order:
         db_insert_deleted_item(deleted_record('order', order))
