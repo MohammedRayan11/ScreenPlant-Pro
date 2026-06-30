@@ -76,6 +76,26 @@ else:
 
 app = Flask(__name__, static_folder=FRONTEND_DIR, static_url_path='')
 
+# gzip/br compression. index.html is a ~500KB single-file SPA bundle served
+# on every form load — under concurrent load this was costing real time and
+# bandwidth per request with no compression. flask-compress shrinks
+# text/html/json/js responses ~70-80% transparently; falls back to no-op if
+# the package isn't installed so a missing dependency never breaks startup.
+try:
+    from flask_compress import Compress
+    app.config['COMPRESS_MIMETYPES'] = [
+        'text/html', 'text/css', 'text/xml', 'application/json',
+        'application/javascript', 'text/javascript',
+    ]
+    app.config['COMPRESS_LEVEL'] = 6
+    app.config['COMPRESS_MIN_SIZE'] = 500
+    Compress(app)
+except ImportError:
+    logging.getLogger('screenplant').warning(
+        "flask-compress not installed — responses will be served uncompressed. "
+        "Add 'flask-compress' to requirements.txt for better performance under load."
+    )
+
 _secret_key = os.environ.get('SCREENPLANT_SECRET_KEY', '')
 _is_https = os.environ.get('SCREENPLANT_HTTPS', '').lower() in ('1', 'true', 'yes')
 
@@ -562,6 +582,7 @@ def pg_connection(max_retries: int = 2, _retry_delay: float = 0.25):
 
         if pool is not None:
             conn = pool.getconn()
+            returned = False
             try:
                 yield conn
                 return
@@ -574,18 +595,38 @@ def pg_connection(max_retries: int = 2, _retry_delay: float = 0.25):
                     pass
                 try:
                     pool.putconn(conn)
+                    returned = True
                 except Exception:
                     try:
                         conn.close()
                     except Exception:
                         pass
+                    returned = True
                 # Only retry on known transient connection errors
                 if pgcode in _PG_RETRYABLE_ERRCODES and attempt < max_retries:
                     continue
                 raise
+            finally:
+                # BUGFIX: the success path used to fall through to `return`
+                # without ever calling pool.putconn(), permanently leaking
+                # one connection from the pool on every successful write.
+                # Under sustained traffic this silently drains the pool to
+                # zero and it never recovers on its own — only a process
+                # restart used to reset it. This finally block guarantees
+                # the connection is always returned exactly once, on every
+                # exit path (success, retry, or final raise).
+                if not returned:
+                    try:
+                        pool.putconn(conn)
+                    except Exception:
+                        try:
+                            conn.close()
+                        except Exception:
+                            pass
         else:
             psycopg, tuple_row, _ = pg_driver()
             conn = psycopg.connect(DATABASE_URL, row_factory=tuple_row, connect_timeout=10)
+            closed = False
             try:
                 yield conn
                 return
@@ -600,9 +641,18 @@ def pg_connection(max_retries: int = 2, _retry_delay: float = 0.25):
                     conn.close()
                 except Exception:
                     pass
+                closed = True
                 if pgcode in _PG_RETRYABLE_ERRCODES and attempt < max_retries:
                     continue
                 raise
+            finally:
+                # Same leak fix for the no-pool fallback path: close the
+                # raw connection on success too, not just on error.
+                if not closed:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
 
     raise last_exc  # exhausted all retries
 
@@ -1198,7 +1248,32 @@ def public_school_payload(school):
         "classes": school.get("classes", []),
     }
 
+# In-process TTL cache for the public schools list. GET /api/schools is hit
+# by EVERY student's form load (to populate the school dropdown), not just
+# admin dashboards. Under a burst of hundreds/thousands of concurrent students,
+# this was the single biggest source of Postgres connection-pool pressure —
+# each load grabbed a pooled connection for data that changes maybe a few
+# times a day. An 8s staleness window is invisible to users and cuts that
+# load to near zero. Admin (public_only=False) is NOT cached, since admins
+# need to see fresh data right after adding/editing a school.
+_schools_cache_lock = threading.Lock()
+_schools_cache = {"data": None, "expires": 0.0}
+SCHOOLS_CACHE_TTL = float(os.environ.get('SCREENPLANT_SCHOOLS_CACHE_TTL', '8'))
+
 def db_list_schools(public_only=True):
+    if public_only:
+        now = time.monotonic()
+        with _schools_cache_lock:
+            if _schools_cache["data"] is not None and now < _schools_cache["expires"]:
+                return _schools_cache["data"]
+        result = _db_list_schools_uncached(public_only=True)
+        with _schools_cache_lock:
+            _schools_cache["data"] = result
+            _schools_cache["expires"] = time.monotonic() + SCHOOLS_CACHE_TTL
+        return result
+    return _db_list_schools_uncached(public_only=False)
+
+def _db_list_schools_uncached(public_only=True):
     init_db()
     if not use_postgres():
         with closing(sqlite_conn()) as conn:
@@ -2638,7 +2713,7 @@ def before_request_hardening():
     if request.endpoint in {'submit_form'}:
         school_id = request.form.get('school_id', '') if request.method == 'POST' else ''
         rate_key = f"submit:{client_ip}:{school_id}" if school_id else f"submit_form:{client_ip}"
-        if rate_limited(rate_key, 20, 60):
+        if rate_limited(rate_key, int(os.environ.get('SCREENPLANT_SUBMIT_RATE_LIMIT', '60')), 60):
             return jsonify({"error": "Too many requests. Please wait and try again."}), 429
 
 @app.after_request
