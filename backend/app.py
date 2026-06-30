@@ -413,8 +413,8 @@ def _get_pg_pool():
             from psycopg_pool import ConnectionPool
             psycopg, tuple_row, _ = pg_driver()
             min_size = int(os.environ.get('SCREENPLANT_PG_POOL_MIN', '5'))
-            max_size = int(os.environ.get('SCREENPLANT_PG_POOL_MAX', '40'))
-            pool_timeout = float(os.environ.get('SCREENPLANT_PG_POOL_TIMEOUT', '10'))
+            max_size = int(os.environ.get('SCREENPLANT_PG_POOL_MAX', '60'))
+            pool_timeout = float(os.environ.get('SCREENPLANT_PG_POOL_TIMEOUT', '15'))
             _pg_pool = ConnectionPool(
                 DATABASE_URL,
                 min_size=min_size,
