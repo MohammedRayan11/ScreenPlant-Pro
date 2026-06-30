@@ -6826,6 +6826,7 @@ async function submitForm() {
       const err = await res.json().catch(() => ({}));
       // Specific friendly messages for known HTTP status codes
       if (res.status === 429) throw new Error('Too many submissions right now. Please wait a moment and try again.');
+      if (res.status === 503) throw new Error(err.error || 'We\'re receiving a lot of submissions right now. Please wait a few seconds and try again.');
       if (res.status === 413) throw new Error('Your file is too large. Please compress the photo (under 8MB) and try again.');
       throw new Error(err.error || `Server error (${res.status})`);
     }
@@ -7526,6 +7527,7 @@ async function submitFormDynamic() {
     if (!res.ok) {
       const err = await res.json().catch(() => ({}));
       if (res.status === 429) throw new Error('Too many submissions right now. Please wait a moment and try again.');
+      if (res.status === 503) throw new Error(err.error || 'We\'re receiving a lot of submissions right now. Please wait a few seconds and try again.');
       if (res.status === 413) throw new Error('Your file is too large. Please compress the photo (under 8MB) and try again.');
       throw new Error(err.error || `Server error (${res.status})`);
     }
