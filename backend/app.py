@@ -267,6 +267,26 @@ generation_executor = ThreadPoolExecutor(
     max_workers=max(2, int(os.environ.get('SCREENPLANT_GENERATION_WORKERS', '4'))),
     thread_name_prefix='screenplant-gen'
 )
+
+# Bounded pool for background R2 uploads (photo/signature sync after a student
+# submits). Previously each submission spawned its own raw threading.Thread —
+# fine at low volume, but under a 1k+ concurrent submission burst that's 1k+
+# OS threads spawned in a few seconds, competing with gthread's request-handling
+# threads for the same workers. A small fixed pool queues the uploads instead,
+# so submission requests stay fast and R2 sync just trickles through steadily.
+r2_upload_executor = ThreadPoolExecutor(
+    max_workers=max(4, int(os.environ.get('SCREENPLANT_R2_UPLOAD_WORKERS', '12'))),
+    thread_name_prefix='screenplant-r2'
+)
+
+# Concurrency cap for the student-facing submit endpoint. This is a safety net,
+# not the primary fix (the gthread worker-class change + pool resize are) —
+# it just guarantees that if in-flight submissions ever exceed what the app
+# can comfortably serve, the overflow gets a fast, friendly "try again" instead
+# of hanging for 15s+ waiting on a DB connection that was never going to free up.
+_SUBMIT_CONCURRENCY_LIMIT = int(os.environ.get('SCREENPLANT_SUBMIT_CONCURRENCY_LIMIT', '70'))
+_submit_semaphore = threading.Semaphore(_SUBMIT_CONCURRENCY_LIMIT)
+
 rate_bucket = {}
 login_failures = {}   # ip -> {'count': int, 'locked_until': float}
 reset_otps = {}       # phone -> {'hash': str, 'expires': float, 'attempts': int}
@@ -413,8 +433,8 @@ def _get_pg_pool():
             from psycopg_pool import ConnectionPool
             psycopg, tuple_row, _ = pg_driver()
             min_size = int(os.environ.get('SCREENPLANT_PG_POOL_MIN', '5'))
-            max_size = int(os.environ.get('SCREENPLANT_PG_POOL_MAX', '60'))
-            pool_timeout = float(os.environ.get('SCREENPLANT_PG_POOL_TIMEOUT', '15'))
+            max_size = int(os.environ.get('SCREENPLANT_PG_POOL_MAX', '40'))
+            pool_timeout = float(os.environ.get('SCREENPLANT_PG_POOL_TIMEOUT', '10'))
             _pg_pool = ConnectionPool(
                 DATABASE_URL,
                 min_size=min_size,
@@ -3305,7 +3325,30 @@ def get_school_dashboard(school_id):
         "form_url": f"{request.host_url.rstrip('/')}/?school={school_id}"
     })
 
+def limit_concurrent_submits(fn):
+    """
+    Caps in-flight /api/submissions POST requests at _SUBMIT_CONCURRENCY_LIMIT.
+    This is a safety net on top of the pool/worker-class fixes, not a substitute
+    for them — under normal load it never triggers. It only kicks in if requests
+    ever pile up faster than the app can drain them, in which case overflow
+    requests get an immediate, friendly "try again" instead of hanging for the
+    full DB pool timeout.
+    """
+    @wraps(fn)
+    def wrapper(*args, **kwargs):
+        acquired = _submit_semaphore.acquire(blocking=False)
+        if not acquired:
+            return jsonify({
+                "error": "We're receiving a lot of submissions right now. Please wait a few seconds and try again."
+            }), 503
+        try:
+            return fn(*args, **kwargs)
+        finally:
+            _submit_semaphore.release()
+    return wrapper
+
 @app.route('/api/submissions', methods=['POST'])
+@limit_concurrent_submits
 def submit_form():
     """
     Multipart form:
@@ -3453,7 +3496,7 @@ def submit_form():
                         r2_upload(path, key, content_type=content_type)
                     except Exception as _r2e:
                         logger.error("Background R2 upload failed for %s: %s", key, _r2e)
-                threading.Thread(target=_bg_r2_upload, daemon=True, name='r2-upload').start()
+                r2_upload_executor.submit(_bg_r2_upload)
         except Exception as e:
             logger.exception("Could not save photo for %s: %s", photo_label, e)
             if photo_path and os.path.exists(photo_path):
@@ -3486,7 +3529,7 @@ def submit_form():
                         r2_upload(path, key, content_type='image/png')
                     except Exception as _se:
                         logger.error("Background R2 signature upload failed for %s: %s", key, _se)
-                threading.Thread(target=_bg_sig_upload, daemon=True, name='r2-sig-upload').start()
+                r2_upload_executor.submit(_bg_sig_upload)
             except Exception as e:
                 logger.exception("Could not schedule signature upload for %s to R2: %s", photo_label, e)
 
