@@ -2205,11 +2205,36 @@ def write_backup_payload(label, payload):
     safe_label = re.sub(r'[^a-zA-Z0-9_-]+', '_', label)[:30] or 'manual'
     fname = f"screenplant_{safe_label}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
     path = os.path.join(BACKUPS_DIR, fname)
+    body = json.dumps(payload, indent=2, default=str).encode('utf-8')
+
+    # Local copy: fast, used as a short-lived cache by list/download/restore.
+    # NEVER treat this as the durable copy — Railway/Render's filesystem is
+    # ephemeral and is wiped on every redeploy or restart.
     try:
-        with open(path, 'w', encoding='utf-8') as f:
-            json.dump(payload, f, indent=2, default=str)
+        with open(path, 'wb') as f:
+            f.write(body)
     except OSError as e:
-        logger.warning("Could not write backup to disk (ephemeral filesystem?): %s", e)
+        logger.warning("Could not write backup to local disk (ephemeral filesystem?): %s", e)
+
+    # Durable copy: push to R2 synchronously so we know immediately if it
+    # failed, rather than discovering an empty backup history during an
+    # actual emergency. This is the copy that survives redeploys, crashes,
+    # and total container loss.
+    if _USE_R2:
+        try:
+            r2_upload(body, f"backups/{fname}", content_type='application/json')
+        except Exception as e:
+            logger.error(
+                "R2 backup upload FAILED for %s — this backup currently only "
+                "exists on ephemeral local disk and will be lost on next "
+                "redeploy/restart: %s", fname, e
+            )
+    else:
+        logger.warning(
+            "R2 not configured (SCREENPLANT_STORAGE_BACKEND != 'r2') — backup "
+            "%s only exists on ephemeral local disk and WILL be lost on the "
+            "next redeploy/restart.", fname
+        )
     return fname, path
 
 def backup_metadata(payload):
@@ -3762,6 +3787,93 @@ def update_photo_status(sub_id):
     audit('submission.photo_status', f"id={sub_id} status={status}")
     return jsonify(sub)
 
+@app.route('/api/diagnostics/data-integrity', methods=['GET'])
+@admin_required
+def data_integrity_report():
+    """
+    Read-only diagnostic. Finds the two most common causes of "counts don't
+    match between views": submissions pointing at a school_id that no
+    longer exists (orphaned), and multiple school records that share the
+    same display name (so two different IDs look identical in the UI).
+    Nothing here is cached — every number is a live query.
+    """
+    if not use_postgres():
+        with closing(sqlite_conn()) as conn:
+            total_submissions = conn.execute('SELECT COUNT(*) FROM screenplant_submissions').fetchone()[0]
+            orphan_rows = conn.execute('''
+                SELECT sub.school_id, COUNT(*) AS cnt
+                FROM screenplant_submissions sub
+                LEFT JOIN screenplant_schools sc ON sc.id = sub.school_id
+                WHERE sc.id IS NULL
+                GROUP BY sub.school_id
+                ORDER BY cnt DESC
+            ''').fetchall()
+            dup_rows = conn.execute('''
+                SELECT TRIM(LOWER(name)) AS norm_name, COUNT(*) AS cnt
+                FROM screenplant_schools
+                GROUP BY TRIM(LOWER(name))
+                HAVING COUNT(*) > 1
+            ''').fetchall()
+            dup_details = []
+            for norm_name, _cnt in dup_rows:
+                ids = conn.execute('''
+                    SELECT id, name, created_at FROM screenplant_schools
+                    WHERE TRIM(LOWER(name)) = ?
+                ''', (norm_name,)).fetchall()
+                variants = []
+                for sid, name, created_at in ids:
+                    sub_count = conn.execute(
+                        'SELECT COUNT(*) FROM screenplant_submissions WHERE school_id = ?', (sid,)
+                    ).fetchone()[0]
+                    variants.append({"id": sid, "name": name, "created_at": created_at, "live_submission_count": sub_count})
+                dup_details.append({"normalized_name": norm_name, "records": variants})
+    else:
+        with pg_ro_connection() as conn:
+            total_submissions = conn.execute('SELECT COUNT(*) FROM screenplant_submissions').fetchone()[0]
+            orphan_rows = conn.execute('''
+                SELECT sub.school_id, COUNT(*) AS cnt
+                FROM screenplant_submissions sub
+                LEFT JOIN screenplant_schools sc ON sc.id = sub.school_id
+                WHERE sc.id IS NULL
+                GROUP BY sub.school_id
+                ORDER BY cnt DESC
+            ''').fetchall()
+            dup_rows = conn.execute('''
+                SELECT TRIM(LOWER(name)) AS norm_name, COUNT(*) AS cnt
+                FROM screenplant_schools
+                GROUP BY TRIM(LOWER(name))
+                HAVING COUNT(*) > 1
+            ''').fetchall()
+            dup_details = []
+            for norm_name, _cnt in dup_rows:
+                ids = conn.execute('''
+                    SELECT id, name, created_at FROM screenplant_schools
+                    WHERE TRIM(LOWER(name)) = %s
+                ''', (norm_name,)).fetchall()
+                variants = []
+                for sid, name, created_at in ids:
+                    sub_count = conn.execute(
+                        'SELECT COUNT(*) FROM screenplant_submissions WHERE school_id = %s', (sid,)
+                    ).fetchone()[0]
+                    variants.append({"id": sid, "name": name, "created_at": str(created_at), "live_submission_count": sub_count})
+                dup_details.append({"normalized_name": norm_name, "records": variants})
+
+    orphaned = [{"school_id": sid, "orphaned_submission_count": int(cnt)} for sid, cnt in orphan_rows]
+    orphaned_total = sum(o["orphaned_submission_count"] for o in orphaned)
+
+    return jsonify({
+        "total_submissions_in_db": int(total_submissions),
+        "orphaned_submissions": {
+            "description": "Submissions whose school_id does not match any current school record — these will show up in dashboard totals but never appear on any school card.",
+            "total_orphaned": orphaned_total,
+            "by_school_id": orphaned
+        },
+        "duplicate_school_names": {
+            "description": "Multiple school records sharing the same name (trimmed, case-insensitive) — the school card and detail page can end up pointing at different IDs when this happens.",
+            "groups": dup_details
+        }
+    })
+
 @app.route('/api/deleted', methods=['GET'])
 @admin_required
 def get_deleted_items():
@@ -4690,24 +4802,53 @@ def save_settings():
 @app.route('/api/backups', methods=['GET'])
 @admin_required
 def list_backups():
-    files = []
-    for name in sorted(os.listdir(BACKUPS_DIR), reverse=True):
+    seen = {}
+    # Local copies — fast, but may be incomplete or empty right after a
+    # redeploy/restart since local disk is ephemeral.
+    for name in os.listdir(BACKUPS_DIR):
         if not name.endswith('.json'):
             continue
         path = os.path.join(BACKUPS_DIR, name)
-        meta = {}
         try:
             with open(path, 'r', encoding='utf-8') as f:
                 meta = backup_metadata(json.load(f))
         except (OSError, json.JSONDecodeError):
             meta = {"backup_type": "unknown", "scope": ""}
-        files.append({
+        seen[name] = {
             "name": name,
             "size": os.path.getsize(path),
             "created_at": datetime.fromtimestamp(os.path.getmtime(path)).isoformat(),
+            "source": "local",
             **meta
-        })
-    return jsonify(files)
+        }
+    # R2 — the durable source of truth. Fills in anything missing locally
+    # (e.g. everything, if the local disk was just wiped by a redeploy).
+    # We don't download/parse each object's JSON just to list it (would be
+    # slow with many backups), so R2-only entries show backup_type=unknown
+    # until downloaded or restored.
+    if _USE_R2:
+        try:
+            client = _get_r2_client()
+            paginator = client.get_paginator('list_objects_v2')
+            for page in paginator.paginate(Bucket=_R2_BUCKET_NAME, Prefix='backups/'):
+                for obj in page.get('Contents', []):
+                    name = obj['Key'].split('/', 1)[-1]
+                    if not name.endswith('.json'):
+                        continue
+                    if name in seen:
+                        seen[name]["source"] = "local+r2"
+                    else:
+                        seen[name] = {
+                            "name": name,
+                            "size": obj['Size'],
+                            "created_at": obj['LastModified'].isoformat(),
+                            "source": "r2",
+                            "backup_type": "unknown",
+                            "scope": "",
+                        }
+        except Exception as e:
+            logger.warning("Could not list R2 backups: %s", e)
+    return jsonify(sorted(seen.values(), key=lambda b: b['created_at'], reverse=True))
 
 @app.route('/api/backups', methods=['POST'])
 @admin_required
@@ -4734,10 +4875,23 @@ def make_backup():
 @admin_required
 def download_backup(name):
     safe = secure_filename(name)
-    path = os.path.join(BACKUPS_DIR, safe)
-    if not safe.endswith('.json') or not os.path.exists(path):
+    if not safe.endswith('.json'):
         return jsonify({"error": "Backup not found"}), 404
-    return send_from_directory(BACKUPS_DIR, safe, as_attachment=True)
+    path = os.path.join(BACKUPS_DIR, safe)
+    if os.path.exists(path):
+        return send_from_directory(BACKUPS_DIR, safe, as_attachment=True)
+    # Fall back to the durable R2 copy if local disk doesn't have it
+    # (e.g. it was created before the most recent redeploy).
+    if _USE_R2:
+        try:
+            body = r2_download_bytes(f"backups/{safe}")
+            return Response(
+                body, mimetype='application/json',
+                headers={'Content-Disposition': f'attachment; filename="{safe}"'}
+            )
+        except Exception:
+            pass
+    return jsonify({"error": "Backup not found"}), 404
 
 @app.route('/api/backups/restore', methods=['POST'])
 @admin_required
@@ -4751,12 +4905,19 @@ def restore_backup():
             payload = json.load(uploaded.stream)
         else:
             safe = secure_filename(backup_name)
-            path = os.path.join(BACKUPS_DIR, safe)
-            if not safe.endswith('.json') or not os.path.exists(path):
+            if not safe.endswith('.json'):
                 return jsonify({"error": "Backup not found"}), 404
-            with open(path, 'r', encoding='utf-8') as f:
-                payload = json.load(f)
+            path = os.path.join(BACKUPS_DIR, safe)
+            if os.path.exists(path):
+                with open(path, 'r', encoding='utf-8') as f:
+                    payload = json.load(f)
+            elif _USE_R2:
+                payload = json.loads(r2_download_bytes(f"backups/{safe}"))
+            else:
+                return jsonify({"error": "Backup not found"}), 404
     except (ValueError, json.JSONDecodeError, OSError) as e:
+        return jsonify({"error": f"Could not restore backup: {e}"}), 400
+    except Exception as e:
         return jsonify({"error": f"Could not restore backup: {e}"}), 400
     if isinstance(payload, dict) and payload.get('backup_type') == 'screenplant_scope_backup':
         try:
@@ -6076,8 +6237,11 @@ except (OSError, ValueError):
 
 
 # ── Automated daily backup (MF5) ──────────────────────────────────────────────
-_BACKUP_INTERVAL_SECONDS = int(os.environ.get('SCREENPLANT_BACKUP_INTERVAL_HOURS', '24')) * 3600
-_BACKUP_KEEP_COUNT = int(os.environ.get('SCREENPLANT_BACKUP_KEEP', '7'))
+# Default raised from 24h/7 to 6h/30 now that backups are pushed to R2 —
+# durable storage is cheap, so there's no reason to keep so few copies.
+# Override via env vars if you want different values.
+_BACKUP_INTERVAL_SECONDS = int(os.environ.get('SCREENPLANT_BACKUP_INTERVAL_HOURS', '6')) * 3600
+_BACKUP_KEEP_COUNT = int(os.environ.get('SCREENPLANT_BACKUP_KEEP', '30'))
 
 def _prune_old_auto_backups():
     try:
@@ -6089,11 +6253,28 @@ def _prune_old_auto_backups():
         for old in auto_files[_BACKUP_KEEP_COUNT:]:
             try:
                 os.remove(os.path.join(BACKUPS_DIR, old))
-                logger.info("Auto-backup: pruned old backup %s", old)
+                logger.info("Auto-backup: pruned old local backup %s", old)
             except OSError:
                 pass
     except Exception as e:
-        logger.warning("Auto-backup: prune failed: %s", e)
+        logger.warning("Auto-backup: local prune failed: %s", e)
+
+    # Prune the durable R2 copies too, on the same retention count, so
+    # storage doesn't grow unbounded forever.
+    if _USE_R2:
+        try:
+            client = _get_r2_client()
+            paginator = client.get_paginator('list_objects_v2')
+            objs = []
+            for page in paginator.paginate(Bucket=_R2_BUCKET_NAME, Prefix='backups/screenplant_auto_'):
+                objs.extend(page.get('Contents', []))
+            objs.sort(key=lambda o: o['LastModified'], reverse=True)
+            stale = objs[_BACKUP_KEEP_COUNT:]
+            if stale:
+                r2_delete_many([o['Key'] for o in stale])
+                logger.info("Auto-backup: pruned %d old R2 backup(s)", len(stale))
+        except Exception as e:
+            logger.warning("Auto-backup: R2 prune failed: %s", e)
 
 def _auto_backup():
     # Stagger startup by 60s so this doesn't race with trash-cleanup at boot
