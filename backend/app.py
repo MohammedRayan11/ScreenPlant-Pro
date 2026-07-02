@@ -3861,6 +3861,24 @@ def data_integrity_report():
     orphaned = [{"school_id": sid, "orphaned_submission_count": int(cnt)} for sid, cnt in orphan_rows]
     orphaned_total = sum(o["orphaned_submission_count"] for o in orphaned)
 
+    # Cross-check: for every real school row, call BOTH counting functions
+    # server-side with the exact same id string, in the same request. This
+    # removes any possibility of a frontend/URL id mismatch being the
+    # cause — if these disagree here, it's a genuine backend/data bug;
+    # if they agree here, the problem is specifically what id value the
+    # frontend is sending for the detail page.
+    cross_check = []
+    for row in db_analytics_by_school_rows():
+        sid = row["school_id"]
+        live_stats = db_school_submission_stats(sid)
+        cross_check.append({
+            "school_id": repr(sid),  # repr() to reveal hidden whitespace/invisible chars
+            "name": row["name"],
+            "analytics_total": row["total"],
+            "detail_page_total": live_stats["students"],
+            "MATCH": row["total"] == live_stats["students"]
+        })
+
     return jsonify({
         "total_submissions_in_db": int(total_submissions),
         "orphaned_submissions": {
@@ -3871,6 +3889,10 @@ def data_integrity_report():
         "duplicate_school_names": {
             "description": "Multiple school records sharing the same name (trimmed, case-insensitive) — the school card and detail page can end up pointing at different IDs when this happens.",
             "groups": dup_details
+        },
+        "cross_check_analytics_vs_detail_page": {
+            "description": "Both counting functions called server-side with the identical id string, in this same request. If MATCH is false for any school, it's a genuine backend bug. If all MATCH is true, the discrepancy you're seeing in the UI is caused by the frontend sending a different id than the one the grid uses.",
+            "results": cross_check
         }
     })
 
