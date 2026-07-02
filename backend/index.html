@@ -4781,6 +4781,21 @@ function labelToFieldKey(label) {
 
 // ── Load All ─────────────────────────────────────────────────────────────────
 let schools=[], submissions=[], templates_=[], orders=[], lastStats=null;
+// Live, accurate per-school stats from the backend (db_analytics_by_school_rows).
+// This is the source of truth for the Schools/Orgs grid — NEVER derive
+// per-school totals from the `submissions` array, which is capped to the
+// 200 most recent records app-wide and goes stale after any CRUD action.
+let schoolAnalytics = {};
+async function loadSchoolAnalytics() {
+  try {
+    const rows = await api('GET', '/api/analytics/by-school');
+    schoolAnalytics = {};
+    (rows || []).forEach(r => { schoolAnalytics[r.school_id] = r; });
+  } catch (e) {
+    // Non-critical — renderSchools() falls back to client-side computation
+    // (which may be stale/capped) if this fetch fails.
+  }
+}
 let submissionsPageInfo = { total: 0, page: 1, per_page: 200, pages: 1 };
 async function loadAll() {
   try {
@@ -4801,6 +4816,7 @@ async function loadAll() {
     }
     if (tplsRes.status === 'fulfilled') templates_ = tplsRes.value || [];
     if (ordersRes.status === 'fulfilled') orders = ordersRes.value || [];
+    await loadSchoolAnalytics().catch(() => {}); // accurate per-school stats; non-critical if it fails
 
     // If ALL failed, treat as offline
     const allFailed = [schoolsRes, subsRes, tplsRes, ordersRes].every(r => r.status === 'rejected');
@@ -5519,6 +5535,7 @@ async function delSubFromDash(id) {
     sdpRenderAll();
     renderSubs();
     toast('Deleted','warning');
+    loadSchoolAnalytics().then(() => { if (document.getElementById('schools-grid')) renderSchools(); }).catch(() => {});
   } catch(e) { submissions = submissions.filter(s=>s.id!==id); sdpRenderAll(); }
 }
 
@@ -5942,6 +5959,7 @@ async function delSub(id) {
     await api('DELETE',`/api/submissions/${id}`);
     submissions = submissions.filter(s=>s.id!==id);
     renderSubs(); toast('Deleted','warning');
+    loadSchoolAnalytics().then(() => { if (document.getElementById('schools-grid')) renderSchools(); }).catch(() => {});
   } catch(e) {}
 }
 
@@ -6826,7 +6844,6 @@ async function submitForm() {
       const err = await res.json().catch(() => ({}));
       // Specific friendly messages for known HTTP status codes
       if (res.status === 429) throw new Error('Too many submissions right now. Please wait a moment and try again.');
-      if (res.status === 503) throw new Error(err.error || 'We\'re receiving a lot of submissions right now. Please wait a few seconds and try again.');
       if (res.status === 413) throw new Error('Your file is too large. Please compress the photo (under 8MB) and try again.');
       throw new Error(err.error || `Server error (${res.status})`);
     }
@@ -7527,7 +7544,6 @@ async function submitFormDynamic() {
     if (!res.ok) {
       const err = await res.json().catch(() => ({}));
       if (res.status === 429) throw new Error('Too many submissions right now. Please wait a moment and try again.');
-      if (res.status === 503) throw new Error(err.error || 'We\'re receiving a lot of submissions right now. Please wait a few seconds and try again.');
       if (res.status === 413) throw new Error('Your file is too large. Please compress the photo (under 8MB) and try again.');
       throw new Error(err.error || `Server error (${res.status})`);
     }
@@ -8396,26 +8412,46 @@ window._injectorInit = false;
     const q = ($('sch-q')?.value || '').toLowerCase();
     const grid = $('schools-grid'); if (!grid) return;
     let list = schools.map(s => {
-      const subs = submissions.filter(x=>x.school_id===s.id);
-      const pct = completion(subs);
+      // Prefer live backend analytics (accurate, unpaginated) over the
+      // client-side `submissions` array, which is capped to the 200 most
+      // recent records app-wide and can be stale after any CRUD action.
+      const live = schoolAnalytics[s.id];
+      let subCount, pct, pend, gen, pr, last;
+      if (live) {
+        subCount = live.total;
+        pct = live.pct;
+        pend = live.pending;
+        gen = live.generated;
+        pr = live.printed;
+        last = live.last_submission || '';
+      } else {
+        // Fallback only used if the analytics fetch failed — may be
+        // incomplete/stale, kept purely so the UI doesn't break offline.
+        const subs = submissions.filter(x=>x.school_id===s.id);
+        subCount = subs.length;
+        pct = completion(subs);
+        pend = subs.filter(x=>x.status==='pending').length;
+        gen = subs.filter(x=>x.status==='generated').length;
+        pr = subs.filter(x=>x.status==='printed').length;
+        last = subs.map(x=>x.submitted_at).sort().pop() || '';
+      }
       const h = health(pct);
-      const last = subs.map(x=>x.submitted_at).sort().pop() || '';
-      return {...s, _subs:subs, _pct:pct, _health:h[0], _healthLabel:h[1], _last:last};
+      return {...s, _subCount:subCount, _pct:pct, _pend:pend, _gen:gen, _pr:pr, _health:h[0], _healthLabel:h[1], _last:last};
     }).filter(s => {
       const hay = [s.name,s.type,s.contact,s.email,s.phone].join(' ').toLowerCase();
       return (!q || fuzzy(hay,q)) && (sp.schoolType==='all' || s.type===sp.schoolType) && (sp.schoolHealth==='all' || s._health===sp.schoolHealth);
     });
-    list.sort((a,b) => sp.schoolSort==='name' ? String(a.name).localeCompare(b.name) : sp.schoolSort==='completion' ? b._pct-a._pct : sp.schoolSort==='date' ? String(b.created_at||'').localeCompare(String(a.created_at||'')) : b._subs.length-a._subs.length);
+    list.sort((a,b) => sp.schoolSort==='name' ? String(a.name).localeCompare(b.name) : sp.schoolSort==='completion' ? b._pct-a._pct : sp.schoolSort==='date' ? String(b.created_at||'').localeCompare(String(a.created_at||'')) : b._subCount-a._subCount);
     if ($('sp-school-count')) $('sp-school-count').textContent = `Showing ${list.length} of ${schools.length} schools`;
     if (!list.length) { grid.innerHTML = `<div class="no-data"><div class="no-data-ico">🏫</div><h3>No schools found</h3><p>Adjust filters or add your first school.</p><button class="btn btn-p" onclick="openSchoolModal()">Add your first school</button></div>`; return; }
     grid.innerHTML = list.map(s => {
-      const pend=s._subs.filter(x=>x.status==='pending').length, gen=s._subs.filter(x=>x.status==='generated').length, pr=s._subs.filter(x=>x.status==='printed').length;
+      const pend=s._pend, gen=s._gen, pr=s._pr;
       const link = `${window.location.origin}${window.location.pathname}?school=${s.id}`;
       return `<div class="sc" id="school-card-${attr(s.id)}" style="border-top:3px solid ${attr(s.color||'#1a73e8')};cursor:pointer" onclick="openSchoolDashboard('${attr(s.id)}')">
         <span style="position:absolute;right:12px;top:12px" class="sp-health ${s._health}">${safe(s._healthLabel)}</span>
         ${miniDonut(pend,gen,pr)}
         <div class="sc-top"><div class="sc-ico" style="background:${attr(s.color||'#1a73e8')}20">${emoji(s.type)}</div><div style="min-width:0"><div class="sc-name">${safe(s.name)}</div><div class="sc-type">${safe(s.type)}</div></div></div>
-        <div class="sc-stats"><div><div class="sc-stat-v">${s._subs.length}</div><div class="sc-stat-l">Students</div></div><div><div class="sc-stat-v">${s._pct}%</div><div class="sc-stat-l">Photos</div></div><div><div class="sc-stat-v">${templates_.filter(t=>t.school_id===s.id).length}</div><div class="sc-stat-l">Templates</div></div></div>
+        <div class="sc-stats"><div><div class="sc-stat-v">${s._subCount}</div><div class="sc-stat-l">Students</div></div><div><div class="sc-stat-v">${s._pct}%</div><div class="sc-stat-l">Photos</div></div><div><div class="sc-stat-v">${templates_.filter(t=>t.school_id===s.id).length}</div><div class="sc-stat-l">Templates</div></div></div>
         <div class="sp-progress" style="margin-bottom:8px"><span style="background:${s._pct>=80?'var(--green)':s._pct>=50?'var(--amber)':'var(--red)'};width:${s._pct}%"></span></div>
         <div style="font-size:.74rem;color:var(--text2);margin-bottom:10px">${pend} pending · ${gen} generated · ${pr} printed</div>
         <div style="font-size:.73rem;color:var(--text3);margin-bottom:10px">Last submission: ${s._last ? timeAgo(s._last) : 'No submissions yet'}</div>
