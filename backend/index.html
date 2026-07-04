@@ -5190,9 +5190,6 @@ let dashClassFilter = '__all__';
 let dashSectionFilter = '__all__';
 let sdpCurrentTab = 'submissions';
 
-// Per-school submissions cache — keyed by school_id
-const _schoolSubsCache = {};
-
 function openSchoolDashboard(schoolId) {
   const s = schools.find(x=>x.id===schoolId);
   if (!s) return;
@@ -5201,26 +5198,6 @@ function openSchoolDashboard(schoolId) {
   dashClassFilter = '__all__';
   dashSectionFilter = '__all__';
   sdpCurrentTab = 'submissions';
-
-  // Fetch ALL submissions for this school in background BEFORE rendering
-  // Without paginate=1, backend returns all records with no limit
-  api('GET', '/api/submissions?school_id=' + encodeURIComponent(schoolId))
-    .then(data => {
-      const schoolSubs = Array.isArray(data) ? data : (data.items || []);
-      // Store in cache
-      _schoolSubsCache[schoolId] = schoolSubs;
-      // Merge any new ones into global array
-      const existingIds = new Set(submissions.map(x=>x.id));
-      schoolSubs.forEach(sub => { if (!existingIds.has(sub.id)) submissions.push(sub); });
-    })
-    .catch(() => {
-      // Fallback to whatever is in global array
-      _schoolSubsCache[schoolId] = submissions.filter(x=>x.school_id===schoolId);
-    })
-    .finally(() => {
-      // Re-render dashboard with complete data after fetch completes
-      sdpRenderAll();
-    });
 
   const frame = document.getElementById('school-dashboard-frame');
   const template = document.getElementById('school-dashboard-template');
@@ -5238,8 +5215,6 @@ function openSchoolDashboard(schoolId) {
           });
         }
       } catch (_err) {}
-      // Initial render with whatever data we have (may update again after fetch)
-      sdpRenderAll();
     };
     frame.srcdoc = template.innerHTML.trim();
   }
@@ -5279,7 +5254,7 @@ function sdpRenderAll() {
 
 function sdpRenderStats() {
   const s = schools.find(x=>x.id===currentDashSchoolId);
-  const subs = (_schoolSubsCache[currentDashSchoolId] || submissions.filter(x=>x.school_id===currentDashSchoolId));
+  const subs = submissions.filter(x=>x.school_id===currentDashSchoolId);
   const pending = subs.filter(x=>x.status==='pending').length;
   const generated = subs.filter(x=>x.status==='generated').length;
   const printed = subs.filter(x=>x.status==='printed').length;
@@ -5296,7 +5271,7 @@ function sdpRenderStats() {
 }
 
 function sdpRenderStudents() {
-  const subs = (_schoolSubsCache[currentDashSchoolId] || submissions.filter(x=>x.school_id===currentDashSchoolId));
+  const subs = submissions.filter(x=>x.school_id===currentDashSchoolId);
   const s = schools.find(x=>x.id===currentDashSchoolId);
   const classes = s?.classes || [];
   const q = (document.getElementById('sdp-search')?.value||'').toLowerCase();
@@ -5372,7 +5347,7 @@ function sdpSetClassFilter(cls, sec) {
 }
 
 function sdpRenderPhotos() {
-  const subs = (_schoolSubsCache[currentDashSchoolId] || submissions.filter(x=>x.school_id===currentDashSchoolId));
+  const subs = submissions.filter(x=>x.school_id===currentDashSchoolId);
   const wrap = document.getElementById('sdp-photos-grid');
   if (!wrap) return;
   const withPhoto = subs.filter(x=>x.photo_url||x.photo_path);
@@ -5824,7 +5799,7 @@ function renderSchoolExport(preselectId='') {
 
   const schoolId = sel.value;
   const school = schools.find(s => s.id === schoolId);
-  const schoolSubs = (_schoolSubsCache[schoolId] || submissions).filter(s => s.school_id === schoolId);
+  const schoolSubs = submissions.filter(s => s.school_id === schoolId);
   const photoCount = schoolSubs.filter(s => s.photo_path).length;
   const missingPhotos = Math.max(schoolSubs.length - photoCount, 0);
 
@@ -5909,7 +5884,7 @@ async function exportSchoolCSV(schoolId) {
     URL.revokeObjectURL(u); toast('Exported!','success');
   } catch(e) {
     // Offline fallback — build CSV dynamically from in-memory data
-    const list = (_schoolSubsCache[schoolId] || submissions).filter(s => s.school_id === schoolId);
+    const list = submissions.filter(s => s.school_id === schoolId);
     if (!list.length) { toast('No data to export','error'); return; }
 
     // Discover all columns that actually have data
@@ -7777,7 +7752,7 @@ function injOnSchoolChange() {
   if (injSourceMode !== 'saved') return;
   if (!schoolId) { injStudentOrder = []; renderInjOrderList(); renderInjGridPreview(); updateInjReadyState(); return; }
   // Build student order list
-  const schoolSubs = (_schoolSubsCache[schoolId] || submissions).filter(s => s.school_id === schoolId);
+  const schoolSubs = submissions.filter(s => s.school_id === schoolId);
   injStudentOrder = schoolSubs.map(s => s.unique_id || s.roll_no || s.name || s.id);
   renderInjOrderList();
   renderInjGridPreview();
