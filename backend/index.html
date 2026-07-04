@@ -5190,11 +5190,10 @@ let dashClassFilter = '__all__';
 let dashSectionFilter = '__all__';
 let sdpCurrentTab = 'submissions';
 
-// Per-school submissions cache — loaded fresh when opening each school dashboard
-// Fixes the "50 instead of 437" bug caused by the global 200-record pagination limit
+// Per-school submissions cache — keyed by school_id
 const _schoolSubsCache = {};
 
-async function openSchoolDashboard(schoolId) {
+function openSchoolDashboard(schoolId) {
   const s = schools.find(x=>x.id===schoolId);
   if (!s) return;
   currentDashSchoolId = schoolId;
@@ -5203,30 +5202,25 @@ async function openSchoolDashboard(schoolId) {
   dashSectionFilter = '__all__';
   sdpCurrentTab = 'submissions';
 
-  showPage('pg-school-dash');
-
-  // Show loading state immediately
-  const statsEl = document.getElementById('sdp-stats');
-  if (statsEl) statsEl.innerHTML = '<div style="padding:20px;color:var(--text2)">⏳ Loading students...</div>';
-
-  // Fetch ALL submissions for this specific school
-  // Uses non-paginated endpoint (no paginate=1 param) which returns all records
-  try {
-    const data = await api('GET', `/api/submissions?school_id=${encodeURIComponent(schoolId)}`);
-    const schoolSubs = Array.isArray(data) ? data : (data.items || []);
-    // Merge into global submissions array (add any missing ones)
-    const existingIds = new Set(submissions.map(x=>x.id));
-    schoolSubs.forEach(sub => { if (!existingIds.has(sub.id)) submissions.push(sub); });
-    // Update cache
-    _schoolSubsCache[schoolId] = schoolSubs;
-  } catch(e) {
-    // Fallback to whatever we have in the global array
-    _schoolSubsCache[schoolId] = submissions.filter(x=>x.school_id===schoolId);
-    console.warn('School submissions fetch failed, using cached data:', e);
-  }
-
-  // Now render with full data
-  sdpRenderAll();
+  // Fetch ALL submissions for this school in background BEFORE rendering
+  // Without paginate=1, backend returns all records with no limit
+  api('GET', '/api/submissions?school_id=' + encodeURIComponent(schoolId))
+    .then(data => {
+      const schoolSubs = Array.isArray(data) ? data : (data.items || []);
+      // Store in cache
+      _schoolSubsCache[schoolId] = schoolSubs;
+      // Merge any new ones into global array
+      const existingIds = new Set(submissions.map(x=>x.id));
+      schoolSubs.forEach(sub => { if (!existingIds.has(sub.id)) submissions.push(sub); });
+    })
+    .catch(() => {
+      // Fallback to whatever is in global array
+      _schoolSubsCache[schoolId] = submissions.filter(x=>x.school_id===schoolId);
+    })
+    .finally(() => {
+      // Re-render dashboard with complete data after fetch completes
+      sdpRenderAll();
+    });
 
   const frame = document.getElementById('school-dashboard-frame');
   const template = document.getElementById('school-dashboard-template');
@@ -5244,9 +5238,12 @@ async function openSchoolDashboard(schoolId) {
           });
         }
       } catch (_err) {}
+      // Initial render with whatever data we have (may update again after fetch)
+      sdpRenderAll();
     };
     frame.srcdoc = template.innerHTML.trim();
   }
+  showPage('pg-school-dash');
 }
 function closeSchoolDashPage() {
   showPage('pg-admin');
