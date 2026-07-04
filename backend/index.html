@@ -5209,9 +5209,10 @@ async function openSchoolDashboard(schoolId) {
   const statsEl = document.getElementById('sdp-stats');
   if (statsEl) statsEl.innerHTML = '<div style="padding:20px;color:var(--text2)">⏳ Loading students...</div>';
 
-  // Fetch ALL submissions for this specific school (bypasses the 200-record global limit)
+  // Fetch ALL submissions for this specific school
+  // Uses non-paginated endpoint (no paginate=1 param) which returns all records
   try {
-    const data = await api('GET', `/api/submissions?school_id=${encodeURIComponent(schoolId)}&per_page=9999`);
+    const data = await api('GET', `/api/submissions?school_id=${encodeURIComponent(schoolId)}`);
     const schoolSubs = Array.isArray(data) ? data : (data.items || []);
     // Merge into global submissions array (add any missing ones)
     const existingIds = new Set(submissions.map(x=>x.id));
@@ -5221,6 +5222,7 @@ async function openSchoolDashboard(schoolId) {
   } catch(e) {
     // Fallback to whatever we have in the global array
     _schoolSubsCache[schoolId] = submissions.filter(x=>x.school_id===schoolId);
+    console.warn('School submissions fetch failed, using cached data:', e);
   }
 
   // Now render with full data
