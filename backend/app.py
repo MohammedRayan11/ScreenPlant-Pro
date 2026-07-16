@@ -333,11 +333,6 @@ _templates_cache = {'data': None, 'expires': 0.0}
 _templates_cache_lock = threading.Lock()
 _TEMPLATES_CACHE_TTL = 60
 
-# Schools cache — schools rarely change; 60s TTL
-_schools_cache = {'data': None, 'expires': 0.0}
-_schools_cache_lock = threading.Lock()
-_SCHOOLS_CACHE_TTL = 60
-
 # [ENHANCED] Runtime password hashing for the change-password endpoint. Existing
 # env-based plaintext auth remains supported for backward compatibility.
 def password_hash(raw):
