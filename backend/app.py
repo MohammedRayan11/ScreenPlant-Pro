@@ -3301,7 +3301,24 @@ def submit_form():
             # auto-correct orientation before storage. Raw save would preserve PII.
             try:
                 from PIL import ImageOps
+                _MAX_PHOTO_PX = int(os.environ.get('SCREENPLANT_MAX_PHOTO_PX', '1200'))
+                _COMPRESS_THRESHOLD_BYTES = int(os.environ.get('SCREENPLANT_COMPRESS_THRESHOLD_BYTES', str(1 * 1024 * 1024)))  # 1MB default
+                # Get original file size
+                photo_file.stream.seek(0, 2)  # seek to end
+                original_size_bytes = photo_file.stream.tell()
+                photo_file.stream.seek(0)  # reset
                 img_raw = Image.open(photo_file.stream)
+                # Decode straight to a reduced scale for large JPEGs instead of
+                # materializing the full-resolution bitmap first. A 12MP phone photo
+                # (up to MAX_IMAGE_BYTES=8MB on disk) fully decodes to ~35-50MB of raw
+                # pixels in RAM — and that RAM isn't handed back to the OS once freed
+                # (CPython/glibc keep it reserved for reuse), so the process's memory
+                # only ratchets upward as more photos come in over the day. draft()
+                # asks libjpeg to decode at the nearest smaller power-of-2 scale up
+                # front; thumbnail() below still does the exact final resize with
+                # LANCZOS afterward, so the saved output is unchanged.
+                if img_raw.format == 'JPEG':
+                    img_raw.draft('RGB', (_MAX_PHOTO_PX, _MAX_PHOTO_PX))
                 img_raw = ImageOps.exif_transpose(img_raw)  # fix rotation from EXIF
                 img_save = img_raw.convert('RGB')
                 save_ext = ext.lower().lstrip('.')
@@ -3313,12 +3330,6 @@ def submit_form():
                 # - Photos under 1MB: save at high quality (95), no resize — preserve original quality
                 # - Photos over 1MB: resize to 1200px max and compress to quality 82
                 # - Photos under 400px (genuinely low-res): always save at quality 95
-                _MAX_PHOTO_PX = int(os.environ.get('SCREENPLANT_MAX_PHOTO_PX', '1200'))
-                _COMPRESS_THRESHOLD_BYTES = int(os.environ.get('SCREENPLANT_COMPRESS_THRESHOLD_BYTES', str(1 * 1024 * 1024)))  # 1MB default
-                # Get original file size
-                photo_file.stream.seek(0, 2)  # seek to end
-                original_size_bytes = photo_file.stream.tell()
-                photo_file.stream.seek(0)  # reset
                 is_small_res = max(img_save.width, img_save.height) < 400
                 needs_compression = original_size_bytes > _COMPRESS_THRESHOLD_BYTES
                 if needs_compression and not is_small_res:
@@ -3329,6 +3340,8 @@ def submit_form():
                 else:
                     # Small photo or low-res — preserve quality, no resize
                     img_save.save(photo_path, format=fmt, quality=95, optimize=True)
+                img_save.close()
+                img_raw.close()
             except Exception:
                 # Pillow re-save failed — fall back to raw save (still validated above)
                 photo_file.stream.seek(0)
